@@ -27,7 +27,7 @@ test_params = [
             stage_config_path=_CI_DEPLOY,
             use_stage_cli=True,
             server_args=[
-                "--no-async-chunk",
+                "--trust-remote-code", "--no-async-chunk",
             ],
         ),
         id="default",

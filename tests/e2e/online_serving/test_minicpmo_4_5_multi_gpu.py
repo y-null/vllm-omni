@@ -50,7 +50,7 @@ test_params_2gpu = [
     pytest.param(
         OmniServerParams(
             model=_MODEL, stage_config_path=_DEFAULT_CONFIG,
-            use_stage_cli=True, server_args=["--no-async-chunk"],
+            use_stage_cli=True, server_args=["--trust-remote-code", "--no-async-chunk"],
         ),
         id="2gpu_default",
     )
@@ -60,7 +60,7 @@ test_params_3gpu = [
     pytest.param(
         OmniServerParams(
             model=_MODEL, stage_config_path=_TP2_CONFIG,
-            use_stage_cli=True, server_args=["--no-async-chunk"],
+            use_stage_cli=True, server_args=["--trust-remote-code", "--no-async-chunk"],
         ),
         id="3gpu_tp2",
     )
