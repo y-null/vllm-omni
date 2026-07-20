@@ -25,7 +25,7 @@ _QUANT_CONFIG = modify_stage_config(
     },
 )
 
-test_params = [(model, _QUANT_CONFIG) for model in models]
+test_params = [ (model, None, {"deploy_config": _QUANT_CONFIG, "trust_remote_code": True}) for model in models ]
 
 
 @pytest.mark.advanced_model
