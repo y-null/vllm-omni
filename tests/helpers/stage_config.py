@@ -602,6 +602,35 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
             },
         ],
     },
+    "minicpmo_4_5": {
+        "base_config": "minicpmo_4_5.yaml",
+        "async_chunk": False,
+        "stages": [
+            {
+                "stage_id": 0,
+                "max_num_seqs": 1,
+                "max_model_len": 16384,
+                "max_num_batched_tokens": 16384,
+                "gpu_memory_utilization": 0.70,
+                "mm_processor_cache_gb": 0,
+                "skip_mm_profiling": True,
+                "default_sampling_params": {
+                    "temperature": 0.0,
+                    "max_tokens": 150,
+                },
+            },
+            {
+                "stage_id": 1,
+                "max_num_seqs": 1,
+                "gpu_memory_utilization": 0.75,
+                "skip_mm_profiling": True,
+                "default_sampling_params": {
+                    "temperature": 0.0,
+                    "max_tokens": 1,
+                },
+            },
+        ],
+    },
 }
 
 
