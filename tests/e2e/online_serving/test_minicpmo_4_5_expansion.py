@@ -13,6 +13,8 @@ from tests.helpers.media import generate_synthetic_audio, generate_synthetic_ima
 from tests.helpers.runtime import OmniServerParams, dummy_messages_from_mix_data
 from tests.helpers.stage_config import get_deploy_config_path
 
+pytestmark = [pytest.mark.full_model, pytest.mark.omni]
+
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 _MODEL = "openbmb/MiniCPM-o-4_5"
@@ -406,13 +408,13 @@ def test_chinese_text_to_audio(omni_server, openai_client) -> None:
     """
     messages = dummy_messages_from_mix_data(
         system_prompt=get_system_prompt(),
-        content_text="ÇëÓÃÖÐÎÄ¼òµ¥½éÉÜÒ»ÏÂ±±¾©¡£",
+        content_text="ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ä¼òµ¥½ï¿½ï¿½ï¿½Ò»ï¿½Â±ï¿½ï¿½ï¿½ï¿½ï¿½",
     )
     request_config = {
         "model": omni_server.model,
         "messages": messages,
         "stream": True,
-        "key_words": {"text": ["±±¾©"]},
+        "key_words": {"text": ["ï¿½ï¿½ï¿½ï¿½"]},
     }
     openai_client.send_omni_request(request_config, request_num=1)
 

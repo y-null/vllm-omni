@@ -603,6 +603,8 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
         ],
     },
     "minicpmo_4_5": {
+        "pipeline": "minicpmo_4_5",
+        
         "base_config": "minicpmo_4_5.yaml",
         "async_chunk": False,
         "stages": [
