@@ -1,4 +1,4 @@
-"""Config/message construction helpers used by tests."""
+﻿"""Config/message construction helpers used by tests."""
 
 import atexit
 import os
@@ -604,7 +604,7 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
     },
     "minicpmo_4_5": {
         "pipeline": "minicpmo_4_5",
-        
+
         "base_config": "minicpmo_4_5.yaml",
         "async_chunk": False,
         "stages": [
