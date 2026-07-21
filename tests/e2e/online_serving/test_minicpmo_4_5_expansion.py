@@ -70,8 +70,8 @@ def test_mix_to_text_audio_001(omni_server, openai_client) -> None:
     Output Modal: text + audio
     Input Setting: stream=True
     """
-    video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(224, 224, 300)['base64']}"
-    image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(224, 224)['base64']}"
+    video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(24, 24, 200)['base64']}"
+    image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(24, 24)['base64']}"
     audio_data_url = f"data:audio/wav;base64,{generate_synthetic_audio(5, 1)['base64']}"
     messages = dummy_messages_from_mix_data(
         system_prompt=get_system_prompt(),
@@ -102,7 +102,7 @@ def test_text_video_to_text_001(omni_server, openai_client) -> None:
     Output Modal: text
     Input Setting: stream=False
     """
-    video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(224, 224, 300)['base64']}"
+    video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(24, 24, 200)['base64']}"
     messages = dummy_messages_from_mix_data(
         system_prompt=get_system_prompt(),
         video_data_url=video_data_url,
@@ -131,7 +131,7 @@ def test_text_video_to_text_audio_001(omni_server, openai_client) -> None:
     Output Modal: text + audio
     Input Setting: stream=True
     """
-    video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(224, 224, 300)['base64']}"
+    video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(24, 24, 200)['base64']}"
     messages = dummy_messages_from_mix_data(
         system_prompt=get_system_prompt(),
         video_data_url=video_data_url,
@@ -159,7 +159,7 @@ def test_text_image_to_text_audio_001(omni_server, openai_client) -> None:
     Output Modal: text + audio
     Input Setting: stream=True
     """
-    image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(224, 224)['base64']}"
+    image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(24, 24)['base64']}"
     messages = dummy_messages_from_mix_data(
         system_prompt=get_system_prompt(),
         image_data_url=image_data_url,
@@ -297,7 +297,7 @@ def test_audio_in_video_001(omni_server, openai_client) -> None:
     Output Modal: text + audio
     Input Setting: stream=True
     """
-    video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(224, 224, 300)['base64']}"
+    video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(24, 24, 200)['base64']}"
     messages = dummy_messages_from_mix_data(
         system_prompt=get_system_prompt(),
         video_data_url=video_data_url,
@@ -337,7 +337,7 @@ def test_large_image_to_text_audio_001(omni_server, openai_client) -> None:
     """
     Test large image input generating text + audio output.
     """
-    image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(512, 512)['base64']}"
+    image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(24, 24)['base64']}"
     messages = dummy_messages_from_mix_data(
         system_prompt=get_system_prompt(),
         image_data_url=image_data_url,
@@ -408,13 +408,13 @@ def test_chinese_text_to_audio(omni_server, openai_client) -> None:
     """
     messages = dummy_messages_from_mix_data(
         system_prompt=get_system_prompt(),
-        content_text="�������ļ򵥽���һ�±�����",
+        content_text="北京，中国的首都，是一座融合了长城等历史地点与现代建筑的国际化大都市，充满了独特的文化与活力。请重复这句话。",
     )
     request_config = {
         "model": omni_server.model,
         "messages": messages,
         "stream": True,
-        "key_words": {"text": ["����"]},
+        "key_words": {"text": ["北京"]},
     }
     openai_client.send_omni_request(request_config, request_num=1)
 

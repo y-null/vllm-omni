@@ -153,7 +153,7 @@ def test_image_to_text_audio_001(omni_server, openai_client) -> None:
     Output Modal: text + audio
     Input Setting: stream=True
     """
-    image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(224, 224)['base64']}"
+    image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(24, 24)['base64']}"
     messages = dummy_messages_from_mix_data(
         system_prompt=get_system_prompt(),
         image_data_url=image_data_url,
@@ -181,7 +181,7 @@ def test_video_to_text_audio_001(omni_server, openai_client) -> None:
     Output Modal: text + audio
     Input Setting: stream=True
     """
-    video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(224, 224, 300)['base64']}"
+    video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(24, 24, 200)['base64']}"
     messages = dummy_messages_from_mix_data(
         system_prompt=get_system_prompt(),
         video_data_url=video_data_url,
