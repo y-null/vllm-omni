@@ -1,4 +1,4 @@
-﻿"""Config/message construction helpers used by tests."""
+"""Config/message construction helpers used by tests."""
 
 import atexit
 import os
