@@ -27,7 +27,8 @@ test_params = [
             stage_config_path=_CI_DEPLOY,
             use_stage_cli=True,
             server_args=[
-                "--trust-remote-code", "--no-async-chunk",
+                "--trust-remote-code",
+                "--no-async-chunk",
             ],
         ),
         id="default",
@@ -312,6 +313,7 @@ def test_audio_in_video_001(omni_server, openai_client) -> None:
 
     openai_client.send_omni_request(request_config, request_num=1)
 
+
 @pytest.mark.core_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
@@ -329,6 +331,7 @@ def test_text_audio_to_text_audio_001(omni_server, openai_client) -> None:
     request_config = {"model": omni_server.model, "messages": messages, "stream": True}
     openai_client.send_omni_request(request_config, request_num=1)
 
+
 @pytest.mark.core_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
@@ -345,6 +348,7 @@ def test_large_image_to_text_audio_001(omni_server, openai_client) -> None:
     )
     request_config = {"model": omni_server.model, "messages": messages, "stream": True}
     openai_client.send_omni_request(request_config, request_num=1)
+
 
 @pytest.mark.core_model
 @pytest.mark.omni
@@ -369,6 +373,7 @@ def test_talker_in_process_vocoder_path(omni_server, openai_client) -> None:
     responses = openai_client.send_omni_request(request_config, request_num=1)
     has_audio = any(r.audio_bytes is not None and len(r.audio_bytes) > 0 for r in responses)
     assert has_audio, "Expected audio output from in-process token2wav vocoder path"
+
 
 @pytest.mark.core_model
 @pytest.mark.omni
@@ -398,6 +403,7 @@ def test_audio_output_duration_reasonable(omni_server, openai_client) -> None:
             )
             break
 
+
 @pytest.mark.core_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
@@ -417,6 +423,7 @@ def test_chinese_text_to_audio(omni_server, openai_client) -> None:
         "key_words": {"text": ["北京"]},
     }
     openai_client.send_omni_request(request_config, request_num=1)
+
 
 @pytest.mark.core_model
 @pytest.mark.omni

@@ -25,7 +25,7 @@ _QUANT_CONFIG = modify_stage_config(
     },
 )
 
-test_params = [ (model, None, {"deploy_config": _QUANT_CONFIG, "trust_remote_code": True}) for model in models ]
+test_params = [(model, None, {"deploy_config": _QUANT_CONFIG, "trust_remote_code": True}) for model in models]
 
 
 @pytest.mark.advanced_model
@@ -51,6 +51,8 @@ def test_audio_to_text_autoround(omni_runner, omni_runner_handler) -> None:
     if len(audio.shape) == 2:
         audio = audio.squeeze()
     request_config = {
-        "prompts": "Describe the audio.", "audios": (audio, 16000), "modalities": ["text"],
+        "prompts": "Describe the audio.",
+        "audios": (audio, 16000),
+        "modalities": ["text"],
     }
     omni_runner_handler.send_omni_request(request_config)

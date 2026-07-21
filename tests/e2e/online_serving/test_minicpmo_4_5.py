@@ -27,7 +27,8 @@ test_params = [
             stage_config_path=_CI_DEPLOY,
             use_stage_cli=True,
             server_args=[
-                "--trust-remote-code", "--no-async-chunk",
+                "--trust-remote-code",
+                "--no-async-chunk",
             ],
         ),
         id="default",
@@ -71,9 +72,7 @@ def test_text_to_text_001(omni_server, openai_client) -> None:
     Output Modal: text
     Input Setting: stream=False
     """
-    messages = dummy_messages_from_mix_data(
-        system_prompt=get_system_prompt(), content_text=get_prompt()
-    )
+    messages = dummy_messages_from_mix_data(system_prompt=get_system_prompt(), content_text=get_prompt())
 
     request_config = {
         "model": omni_server.model,
@@ -99,9 +98,7 @@ def test_text_to_audio_001(omni_server, openai_client) -> None:
     Output Modal: text + audio
     Input Setting: stream=True
     """
-    messages = dummy_messages_from_mix_data(
-        system_prompt=get_system_prompt(), content_text=get_prompt()
-    )
+    messages = dummy_messages_from_mix_data(system_prompt=get_system_prompt(), content_text=get_prompt())
 
     request_config = {
         "model": omni_server.model,
@@ -252,6 +249,7 @@ def test_invalid_audio_format_rejected(omni_server, openai_client) -> None:
     )
     assert not responses[0].success
 
+
 @pytest.mark.core_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
@@ -273,6 +271,7 @@ def test_completions_endpoint_available(omni_server, openai_client) -> None:
     )
     assert responses[0].success
 
+
 @pytest.mark.core_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
@@ -281,9 +280,7 @@ def test_streaming_response(omni_server, openai_client) -> None:
     """
     Test streaming text output via OpenAI API returns tokens incrementally.
     """
-    messages = dummy_messages_from_mix_data(
-        system_prompt=get_system_prompt(), content_text=get_prompt()
-    )
+    messages = dummy_messages_from_mix_data(system_prompt=get_system_prompt(), content_text=get_prompt())
     request_config = {
         "model": omni_server.model,
         "messages": messages,

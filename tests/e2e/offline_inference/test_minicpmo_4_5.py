@@ -11,15 +11,13 @@ import pytest
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import generate_synthetic_audio, generate_synthetic_image, generate_synthetic_video
 from tests.helpers.stage_config import get_deploy_config_path
-from vllm_omni.platforms import current_omni_platform
 
 models = ["openbmb/MiniCPM-o-4_5"]
 
 _CI_DEPLOY = get_deploy_config_path("ci/minicpmo_4_5.yaml")
 
 
-
-test_params = [ (model, None, {"deploy_config": _CI_DEPLOY, "trust_remote_code": True}) for model in models ]
+test_params = [(model, None, {"deploy_config": _CI_DEPLOY, "trust_remote_code": True}) for model in models]
 
 
 def get_question(prompt_type: str = "text") -> str:
@@ -105,6 +103,7 @@ def test_mix_to_audio(omni_runner, omni_runner_handler) -> None:
         "modalities": ["audio"],
     }
     omni_runner_handler.send_omni_request(request_config)
+
 
 @pytest.mark.core_model
 @pytest.mark.omni
