@@ -2620,7 +2620,7 @@ class OmniRunner:
     def __exit__(self, exc_type, exc_val, exc_tb):
         if hasattr(self.omni, "close"):
             self.omni.close()
-        # self._cleanup_process()
+        self._cleanup_process()
         run_pre_test_cleanup()
         run_post_test_cleanup()
         cleanup_dist_env_and_memory()
