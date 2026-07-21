@@ -49,8 +49,10 @@ def test_text_to_text(omni_runner, omni_runner_handler) -> None:
 @pytest.mark.parametrize("omni_runner", test_params, indirect=True)
 def test_audio_to_text(omni_runner, omni_runner_handler) -> None:
     """Test processing audio, generating text output."""
-    audio = generate_synthetic_audio(5, 1)["np_array"]
-    request_config = {"prompts": get_question("audio"), "audios": audio, "modalities": ["text"]}
+    audio = generate_synthetic_audio(1, 1, 16000)["np_array"]
+    if len(audio.shape) == 2:
+        audio = audio.squeeze()
+    request_config = {"prompts": get_question("audio"), "audios": (audio, 16000), "modalities": ["text"]}
     omni_runner_handler.send_omni_request(request_config)
 
 
@@ -92,11 +94,13 @@ def test_text_to_audio(omni_runner, omni_runner_handler) -> None:
 @pytest.mark.parametrize("omni_runner", test_params, indirect=True)
 def test_mix_to_audio(omni_runner, omni_runner_handler) -> None:
     """Test processing mixed modalities (image + audio), generating audio output."""
-    audio = generate_synthetic_audio(5, 1)["np_array"]
+    audio = generate_synthetic_audio(1, 1, 16000)["np_array"]
+    if len(audio.shape) == 2:
+        audio = audio.squeeze()
     image = generate_synthetic_image(224, 224)["np_array"]
     request_config = {
         "prompts": get_question("mix"),
-        "audios": audio,
+        "audios": (audio, 16000),
         "images": image,
         "modalities": ["audio"],
     }

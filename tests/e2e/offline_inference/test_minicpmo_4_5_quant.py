@@ -47,8 +47,10 @@ def test_text_to_text_autoround(omni_runner, omni_runner_handler) -> None:
 @pytest.mark.parametrize("omni_runner", test_params, indirect=True)
 def test_audio_to_text_autoround(omni_runner, omni_runner_handler) -> None:
     """Test audio-to-text with AutoRound W4A16 quantization."""
-    audio = generate_synthetic_audio(5, 1)["np_array"]
+    audio = generate_synthetic_audio(1, 1, 16000)["np_array"]
+    if len(audio.shape) == 2:
+        audio = audio.squeeze()
     request_config = {
-        "prompts": "Describe the audio.", "audios": audio, "modalities": ["text"],
+        "prompts": "Describe the audio.", "audios": (audio, 16000), "modalities": ["text"],
     }
     omni_runner_handler.send_omni_request(request_config)
