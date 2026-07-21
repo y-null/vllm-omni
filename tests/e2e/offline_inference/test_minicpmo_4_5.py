@@ -52,7 +52,7 @@ def test_audio_to_text(omni_runner, omni_runner_handler) -> None:
     audio = generate_synthetic_audio(1, 1, 16000)["np_array"]
     if len(audio.shape) == 2:
         audio = audio.squeeze()
-    request_config = {"prompts": [{"role": "user", "content": get_question("audio")}], "audios": (audio, 16000), "modalities": ["text"]}
+    request_config = {"prompts": get_question("audio"), "audios": (audio, 16000), "modalities": ["text"]}
     omni_runner_handler.send_omni_request(request_config)
 
 
