@@ -67,7 +67,7 @@ def get_max_batch_size(size_type="few"):
 @pytest.mark.core_model
 @pytest.mark.advanced_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_text_to_text_001(omni_server, openai_client) -> None:
     """
@@ -92,7 +92,7 @@ def test_text_to_text_001(omni_server, openai_client) -> None:
 
 @pytest.mark.full_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_text_to_audio_001(omni_server, openai_client) -> None:
     """
@@ -117,7 +117,7 @@ def test_text_to_audio_001(omni_server, openai_client) -> None:
 
 @pytest.mark.full_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_audio_to_text_audio_001(omni_server, openai_client) -> None:
     """
@@ -145,7 +145,7 @@ def test_audio_to_text_audio_001(omni_server, openai_client) -> None:
 
 @pytest.mark.full_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_image_to_text_audio_001(omni_server, openai_client) -> None:
     """
@@ -173,7 +173,7 @@ def test_image_to_text_audio_001(omni_server, openai_client) -> None:
 
 @pytest.mark.full_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_video_to_text_audio_001(omni_server, openai_client) -> None:
     """
@@ -201,7 +201,7 @@ def test_video_to_text_audio_001(omni_server, openai_client) -> None:
 
 @pytest.mark.core_model
 @pytest.mark.advanced_model
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_mix_to_text_audio_001(omni_server, openai_client) -> None:
     """

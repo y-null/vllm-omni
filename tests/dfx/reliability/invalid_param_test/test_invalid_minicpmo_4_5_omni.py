@@ -12,7 +12,7 @@ from tests.helpers.mark import hardware_test
 from tests.helpers.runtime import OmniServerParams, OpenAIClientHandler, dummy_messages_from_mix_data
 from tests.helpers.stage_config import get_deploy_config_path
 
-pytestmark = [pytest.mark.slow, pytest.mark.omni]
+pytestmark = [pytest.mark.slow, pytest.mark.omni, pytest.mark.full_model]
 
 _MINICPMO_DEPLOY = get_deploy_config_path("ci/minicpmo_4_5.yaml")
 
@@ -50,9 +50,8 @@ def _system_prompt() -> dict[str, object]:
 def _prompt() -> str:
     return "What is the capital of China? Answer in 20 words."
 
-@pytest.mark.full_model
-@pytest.mark.omni
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
+
+@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", _MINICPMO_SERVER, indirect=True)
 def test_invalid_audio_format_rejected(omni_server: OmniServerParams, openai_client: OpenAIClientHandler) -> None:
     """

@@ -38,9 +38,10 @@ _MINICPMO_SERVER = [
 ]
 
 
+@pytest.mark.advanced_model
 @pytest.mark.full_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", _MINICPMO_SERVER, indirect=True)
 def test_completions_endpoint_available(omni_server: OmniServerParams, openai_client: OpenAIClientHandler) -> None:
     """
