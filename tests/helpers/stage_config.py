@@ -623,7 +623,7 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
             {
                 "stage_id": 1,
                 "max_num_seqs": 1,
-                "gpu_memory_utilization": 0.75,
+                "gpu_memory_utilization": 0.20,
                 "skip_mm_profiling": True,
                 "default_sampling_params": {
                     "temperature": 0.0,

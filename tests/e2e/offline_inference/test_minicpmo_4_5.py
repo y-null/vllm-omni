@@ -72,7 +72,7 @@ def test_image_to_text(omni_runner, omni_runner_handler) -> None:
 @pytest.mark.parametrize("omni_runner", test_params, indirect=True)
 def test_video_to_text(omni_runner, omni_runner_handler) -> None:
     """Test processing video, generating text output."""
-    video = generate_synthetic_video(24, 24, 200)["np_array"]
+    video = generate_synthetic_video(24, 24, 20)["np_array"]
     request_config = {"prompts": get_question("video"), "videos": video, "modalities": ["text"]}
     omni_runner_handler.send_omni_request(request_config)
 
@@ -113,6 +113,6 @@ def test_mix_to_audio(omni_runner, omni_runner_handler) -> None:
 @pytest.mark.parametrize("omni_runner", test_params, indirect=True)
 def test_video_to_audio(omni_runner, omni_runner_handler) -> None:
     """Test processing video, generating audio output."""
-    video = generate_synthetic_video(24, 24, 200)["np_array"]
+    video = generate_synthetic_video(24, 24, 20)["np_array"]
     request_config = {"prompts": get_question("video"), "videos": video, "modalities": ["audio"]}
     omni_runner_handler.send_omni_request(request_config)
