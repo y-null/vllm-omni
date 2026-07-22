@@ -9,7 +9,7 @@ import os
 import pytest
 
 from tests.helpers.mark import hardware_test
-from tests.helpers.media import generate_synthetic_audio, generate_synthetic_image, generate_synthetic_video
+from tests.helpers.media import generate_synthetic_video
 from tests.helpers.runtime import OmniServerParams, dummy_messages_from_mix_data
 from tests.helpers.stage_config import get_deploy_config_path
 
@@ -57,6 +57,7 @@ def get_prompt(prompt_type: str = "text_only") -> str:
         "mix": "What is recited in the audio? What is in this image? Describe the video briefly.",
     }
     return prompts.get(prompt_type, prompts["text_only"])
+
 
 def get_max_batch_size(size_type="few"):
     batch_sizes = {"few": 5, "medium": 100, "large": 256}
