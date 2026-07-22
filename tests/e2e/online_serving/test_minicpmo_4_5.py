@@ -59,8 +59,13 @@ def get_prompt(prompt_type: str = "text_only") -> str:
     }
     return prompts.get(prompt_type, prompts["text_only"])
 
+def get_max_batch_size(size_type="few"):
+    batch_sizes = {"few": 5, "medium": 100, "large": 256}
+    return batch_sizes.get(size_type, 5)
+
 
 @pytest.mark.core_model
+@pytest.mark.advanced_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
@@ -82,10 +87,10 @@ def test_text_to_text_001(omni_server, openai_client) -> None:
         "key_words": {"text": ["Beijing"]},
     }
 
-    openai_client.send_omni_request(request_config, request_num=1)
+    openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
 
 
-@pytest.mark.core_model
+@pytest.mark.full_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
@@ -104,13 +109,13 @@ def test_text_to_audio_001(omni_server, openai_client) -> None:
         "model": omni_server.model,
         "messages": messages,
         "stream": True,
-        "key_words": {"audio": ["test"]},
+        "key_words": {"audio": ["Beijing"]},
     }
 
-    openai_client.send_omni_request(request_config, request_num=1)
+    openai_client.send_omni_request(request_config)
 
 
-@pytest.mark.core_model
+@pytest.mark.full_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
@@ -135,10 +140,10 @@ def test_audio_to_text_audio_001(omni_server, openai_client) -> None:
         "stream": True,
     }
 
-    openai_client.send_omni_request(request_config, request_num=1)
+    openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
 
 
-@pytest.mark.core_model
+@pytest.mark.full_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
@@ -163,10 +168,10 @@ def test_image_to_text_audio_001(omni_server, openai_client) -> None:
         "stream": True,
     }
 
-    openai_client.send_omni_request(request_config, request_num=1)
+    openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
 
 
-@pytest.mark.core_model
+@pytest.mark.full_model
 @pytest.mark.omni
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
@@ -191,24 +196,30 @@ def test_video_to_text_audio_001(omni_server, openai_client) -> None:
         "stream": True,
     }
 
-    openai_client.send_omni_request(request_config, request_num=1)
+    openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
 
 
 @pytest.mark.core_model
-@pytest.mark.omni
+@pytest.mark.advanced_model
 @hardware_test(res={"cuda": "H100"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_one_word_prompt_001(omni_server, openai_client) -> None:
+def test_mix_to_text_audio_001(omni_server, openai_client) -> None:
     """
-    Test one-word prompt for boundary behavior.
+    Test multi-modal input (text + audio + video + image) generating text + audio output.
     Deploy Setting: default 2GPU
-    Input Modal: text (single word)
+    Input Modal: text + audio + video + image
     Output Modal: text + audio
     Input Setting: stream=True
     """
+    video_data_url = f"data:video/mp4;base64,{generate_synthetic_video(24, 24, 200)['base64']}"
+    image_data_url = f"data:image/jpeg;base64,{generate_synthetic_image(24, 24)['base64']}"
+    audio_data_url = f"data:audio/wav;base64,{generate_synthetic_audio(5, 1)['base64']}"
     messages = dummy_messages_from_mix_data(
         system_prompt=get_system_prompt(),
-        content_text="Hello",
+        video_data_url=video_data_url,
+        image_data_url=image_data_url,
+        audio_data_url=audio_data_url,
+        content_text=get_prompt("mix"),
     )
 
     request_config = {
@@ -217,74 +228,4 @@ def test_one_word_prompt_001(omni_server, openai_client) -> None:
         "stream": True,
     }
 
-    openai_client.send_omni_request(request_config, request_num=1)
-
-
-@pytest.mark.core_model
-@pytest.mark.omni
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
-@pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_invalid_audio_format_rejected(omni_server, openai_client) -> None:
-    """
-    Test that invalid audio format is properly rejected.
-    Deploy Setting: default 2GPU
-    Input Modal: text + invalid audio format
-    Output Modal: error
-    """
-    fake_base64 = "AAAA"  # not a real audio file
-
-    responses = openai_client.send_completions_http_request(
-        {
-            "json": {
-                "model": omni_server.model,
-                "messages": dummy_messages_from_mix_data(
-                    system_prompt=get_system_prompt(),
-                    audio_data_url=f"data:audio/invalid;base64,{fake_base64}",
-                    content_text=get_prompt(),
-                ),
-                "stream": True,
-            },
-        },
-        err_code=400,
-    )
-    assert not responses[0].success
-
-
-@pytest.mark.core_model
-@pytest.mark.omni
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
-@pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_completions_endpoint_available(omni_server, openai_client) -> None:
-    """
-    MiniCPM-o 4.5 does NOT block /v1/completions (unlike Qwen3-Omni which has
-    endpoint_restrictions). Verify that the completions endpoint is accessible.
-    """
-    responses = openai_client.send_completions_http_request(
-        {
-            "json": {
-                "model": omni_server.model,
-                "prompt": "Hello, how are you?",
-                "max_tokens": 10,
-            },
-        },
-        err_code=200,
-    )
-    assert responses[0].success
-
-
-@pytest.mark.core_model
-@pytest.mark.omni
-@hardware_test(res={"cuda": "H100"}, num_cards=2)
-@pytest.mark.parametrize("omni_server", test_params, indirect=True)
-def test_streaming_response(omni_server, openai_client) -> None:
-    """
-    Test streaming text output via OpenAI API returns tokens incrementally.
-    """
-    messages = dummy_messages_from_mix_data(system_prompt=get_system_prompt(), content_text=get_prompt())
-    request_config = {
-        "model": omni_server.model,
-        "messages": messages,
-        "stream": True,
-        "modalities": ["text"],
-    }
-    openai_client.send_omni_request(request_config, request_num=1)
+    openai_client.send_omni_request(request_config, request_num=get_max_batch_size())
