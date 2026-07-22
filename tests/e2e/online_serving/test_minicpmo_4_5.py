@@ -59,6 +59,7 @@ def get_prompt(prompt_type: str = "text_only") -> str:
     }
     return prompts.get(prompt_type, prompts["text_only"])
 
+
 def get_max_batch_size(size_type="few"):
     batch_sizes = {"few": 5, "medium": 100, "large": 256}
     return batch_sizes.get(size_type, 5)
