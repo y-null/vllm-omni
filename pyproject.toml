@@ -71,6 +71,7 @@ dev = [
     "kernels<0.15.0", # for accuracy tests comparison with diffusers output (0.15.0 incompatible with diffusers 0.38.0)
     "s3tokenizer>=0.3.0", # for tts test
     "step-audio2>=1.0.0", # Step-Audio2 Token2Wav (flashcosyvoice / hyperpyyaml)
+    "stepaudio2-minicpmo", # for MiniCPM-o 4.5 talker vocoder (stepaudio2-minicpmo Token2wav)
 ]
 
 demo = [
@@ -96,9 +97,7 @@ local = [
 # `n_timesteps` and crashes at construction). A clean `vllm-omni` install
 # does not pull this in by default to avoid forcing the dep onto users
 # who only need other models; opt in with `pip install vllm-omni[minicpmo]`.
-minicpmo = [
-    "stepaudio2-minicpmo",
-]
+
 
 # Optional Blackwell-only fused-bias FP8 GEMM; package is `quack-kernels` (imported
 # as `quack`), not the unrelated `quack`. See docs/user_guide/quantization/fp8.md.
