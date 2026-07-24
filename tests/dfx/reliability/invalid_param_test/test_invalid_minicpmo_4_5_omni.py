@@ -62,7 +62,7 @@ def test_invalid_audio_format_rejected(omni_server: OmniServerParams, openai_cli
     """
     fake_base64 = "AAAA"  # not a real audio file
 
-    responses = openai_client.send_completions_http_request(
+    responses = openai_client.send_chat_completions_http_request(
         {
             "json": {
                 "model": omni_server.model,
