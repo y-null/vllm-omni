@@ -10,7 +10,7 @@ Inputs: text / image / audio / video. Outputs: text and optional **24 kHz** spee
 Please refer to [README.md](../../../README.md). Install the talker extra:
 
 ```bash
-pip install 'vllm-omni[minicpmo]'
+pip install stepaudio2-minicpmo
 ```
 
 ## Launch the server

@@ -14,7 +14,7 @@ from tests.helpers.stage_config import get_deploy_config_path
 
 pytestmark = [pytest.mark.slow, pytest.mark.omni, pytest.mark.full_model]
 
-_MINICPMO_DEPLOY = get_deploy_config_path("minicpmo_4_5.yaml")
+_MINICPMO_DEPLOY = get_deploy_config_path("minicpmo_4_5_2gpu.yaml")
 
 _MINICPMO_SERVER = [
     pytest.param(
@@ -75,5 +75,6 @@ def test_invalid_audio_format_rejected(omni_server: OmniServerParams, openai_cli
             },
         },
         err_code=400,
+        err_message="Invalid or unsupported audio file",
     )
     assert not responses[0].success

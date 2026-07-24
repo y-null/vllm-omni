@@ -240,7 +240,7 @@ vllm serve openbmb/MiniCPM-o-4_5 --omni \
   rejects `n_timesteps`). Install via the published extra:
 
   ```bash
-  pip install 'vllm-omni[minicpmo]'
+  pip install stepaudio2-minicpmo
   ```
 
   Equivalent direct install: `pip install stepaudio2-minicpmo`. A

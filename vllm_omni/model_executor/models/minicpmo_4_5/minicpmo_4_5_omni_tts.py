@@ -180,7 +180,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                         "module (a MiniCPM-o-flavored Token2wav vocoder, NOT the upstream "
                         "stepfun-ai/Step-Audio2 — the upstream signature does not accept "
                         "n_timesteps and will fail at __init__). Install via:\n"
-                        "    pip install 'vllm-omni[minicpmo]'   # recommended, declared as PR extra\n"
+                        "    pip install stepaudio2-minicpmo     # bare token2wav package (provides `from stepaudio2 import Token2wav`)\n"
                         "Equivalent direct installs of the same `from stepaudio2 import Token2wav`\n"
                         "entry point used by openbmb/MiniCPM-o-4_5/modeling_minicpmo.py:\n"
                         "    pip install stepaudio2-minicpmo     # bare token2wav package\n"

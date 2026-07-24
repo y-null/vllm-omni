@@ -18,7 +18,7 @@ from tests.helpers.stage_config import get_deploy_config_path
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 _MODEL = "openbmb/MiniCPM-o-4_5"
-_CI_DEPLOY = get_deploy_config_path("minicpmo_4_5.yaml")
+_CI_DEPLOY = get_deploy_config_path("minicpmo_4_5_2gpu.yaml")
 
 test_params = [
     pytest.param(
@@ -202,6 +202,7 @@ def test_video_to_text_audio_001(omni_server, openai_client) -> None:
 
 @pytest.mark.core_model
 @pytest.mark.advanced_model
+@pytest.mark.omni
 @hardware_test(res={"cuda": "H100", "npu": "A2"}, num_cards=2)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_mix_to_text_audio_001(omni_server, openai_client) -> None:
