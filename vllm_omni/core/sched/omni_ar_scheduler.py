@@ -497,6 +497,24 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
 
+            # [DIAG-SYNC] scheduler-side connector/save_async decision.
+            # Confirms whether the stage1->stage2 bridge+connector path is even
+            # reachable on this platform (adapter None => direct inter_stage
+            # handoff that bypasses custom_process_next_stage_input_func).
+            _cta = "set" if self.chunk_transfer_adapter is not None else "None"
+            _will_save = self.chunk_transfer_adapter is not None and (
+                inter_stage_output is not None or is_segment_finished or finished
+            )
+            logger.info(
+                "[DIAG-SYNC][SCHED] stage_id=%s chunk_transfer_adapter=%s inter_stage_output_present=%s "
+                "is_segment_finished=%s finished=%s will_save_async=%s",
+                getattr(self, "stage_id", None),
+                _cta,
+                inter_stage_output is not None,
+                is_segment_finished,
+                finished,
+                _will_save,
+            )
             if self.chunk_transfer_adapter is not None and (
                 inter_stage_output is not None or is_segment_finished or finished
             ):
