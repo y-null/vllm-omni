@@ -185,6 +185,21 @@ class OmniRequestState(RequestState):
             stop_reason = None
 
         finished = finish_reason is not None
+        # [DIAG-SYNC] final output termination signal inspection
+        _diag_meta_finished = None
+        if not self.mm_accumulated.is_empty:
+            _diag_meta_finished = self.mm_accumulated.metadata.get("meta.finished")
+        logger.info(
+            "[DIAG-SYNC][FINAL] req=%s finish_reason=%r finished=%s is_delta=%s output_kind=%s "
+            "mm_has_tensors=%s mm_meta_finished=%r",
+            getattr(self, "request_id", None),
+            finish_reason,
+            finished,
+            is_delta,
+            self.output_kind,
+            not self.mm_accumulated.is_empty,
+            _diag_meta_finished,
+        )
         final_only = self.output_kind == RequestOutputKind.FINAL_ONLY
 
         if not finished and final_only:

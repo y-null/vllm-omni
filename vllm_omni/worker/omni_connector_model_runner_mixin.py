@@ -718,6 +718,34 @@ class OmniConnectorModelRunnerMixin:
             self._apply_staged_payloads_locked(results)
             for req_id, payload in results.items():
                 self._local_request_metadata[req_id] = self._extract_scheduling_metadata(payload)
+        # [DIAG-SYNC] inspect what the consumer actually received
+        for req_id, payload in results.items():
+            _diag_codes = None
+            _diag_finished = None
+            if isinstance(payload, dict):
+                _diag_codes = payload.get("codes")
+                _diag_meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+                _diag_finished = _diag_meta.get("finished")
+            else:
+                _codes = getattr(payload, "codes", None)
+                _meta = getattr(payload, "meta", None)
+                _diag_codes = getattr(_codes, "audio", None)
+                _diag_finished = getattr(_meta, "finished", None)
+            if isinstance(_diag_codes, torch.Tensor):
+                _diag_code_len = int(_diag_codes.numel())
+            elif hasattr(_diag_codes, "__len__"):
+                _diag_code_len = len(_diag_codes)
+            else:
+                _diag_code_len = None
+            logger.info(
+                "[DIAG-SYNC][CONSUMER-RECV] stage=%s req=%s payload_type=%s has_codes=%s code_len=%s finished=%r",
+                self._stage_id,
+                req_id,
+                type(payload).__name__,
+                _diag_codes is not None,
+                _diag_code_len,
+                _diag_finished,
+            )
         logger.debug(
             "[Stage-%s] recv_full_payload_inputs: consumed %s reqs: %s, stage_recv_req_ids now=%s",
             self._stage_id,
@@ -964,6 +992,12 @@ class OmniConnectorModelRunnerMixin:
             )
             return list(outputs.keys())
         sent_ids: list[str] = []
+        logger.info(
+            "[DIAG-SYNC][PRODUCER-ENTER] stage=%s n_outputs=%s connector_ready=%s",
+            self._stage_id,
+            len(outputs),
+            self._omni_connector is not None,
+        )
         next_stage_id = self._next_stage_id
         for req_id, value in outputs.items():
             if isinstance(value, tuple) and len(value) == 2:
@@ -1000,6 +1034,36 @@ class OmniConnectorModelRunnerMixin:
                     code_len,
                     meta.get("left_context_size"),
                 )
+            # [DIAG-SYNC] producer payload inspection (dict or OmniPayloadStruct)
+            _diag_codes = None
+            _diag_finished = None
+            _diag_last_chunk = None
+            if isinstance(payload, dict):
+                _diag_codes = payload.get("codes")
+                _diag_meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+                _diag_finished = _diag_meta.get("finished")
+                _diag_last_chunk = _diag_meta.get("last_chunk")
+            else:
+                _codes = getattr(payload, "codes", None)
+                _meta = getattr(payload, "meta", None)
+                _diag_codes = getattr(_codes, "audio", None)
+                _diag_finished = getattr(_meta, "finished", None)
+                _diag_last_chunk = getattr(_meta, "last_chunk", None)
+            if isinstance(_diag_codes, torch.Tensor):
+                _diag_code_len = int(_diag_codes.numel())
+            elif hasattr(_diag_codes, "__len__"):
+                _diag_code_len = len(_diag_codes)
+            else:
+                _diag_code_len = None
+            logger.info(
+                "[DIAG-SYNC][PRODUCER] stage=%s req=%s has_codes=%s code_len=%s finished=%r last_chunk=%r",
+                self._stage_id,
+                req_id,
+                _diag_codes is not None,
+                _diag_code_len,
+                _diag_finished,
+                _diag_last_chunk,
+            )
 
             external_req_id = self._resolve_external_req_id(request, req_id)
             chunk_id = self._put_req_chunk[req_id]
