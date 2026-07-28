@@ -308,8 +308,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         external_req_id = request.external_req_id
         chunk_id = self.put_req_chunk[external_req_id]
         connector_put_key = f"{external_req_id}_{stage_id}_{chunk_id}"
-        logger.info(
-        )
         # Process payload in save_loop thread
         payload_data: OmniPayloadStruct | None = None
         if self.custom_process_next_stage_input_func:
@@ -342,9 +340,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             put_key=connector_put_key,
             data=payload_data,
         )
-        logger.info(
-        )
-
         if success:
             self.put_req_chunk[external_req_id] += 1
             self.ramp_chunk_count[external_req_id] += 1

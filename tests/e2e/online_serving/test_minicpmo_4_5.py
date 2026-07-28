@@ -32,7 +32,19 @@ test_params = [
             ],
         ),
         id="default",
-    )
+    ),
+    pytest.param(
+        OmniServerParams(
+            model=_MODEL,
+            stage_config_path=_CI_DEPLOY,
+            use_stage_cli=False,
+            server_args=[
+                "--trust-remote-code",
+                "--no-async-chunk",
+            ],
+        ),
+        id="sync_chunk",
+    ),
 ]
 
 
