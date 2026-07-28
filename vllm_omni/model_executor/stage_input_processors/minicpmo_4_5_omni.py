@@ -352,11 +352,6 @@ def tts2code2wav_full_payload(
     request_id = str(external_id if external_id is not None else internal_id)
     codes = _extract_codec_delta(pooling_output, request_id)
     logger.info(
-        "[DIAG-SYNC][BRIDGE-FULL] req=%s n_codes=%s pooling_type=%s request_finished=%r",
-        request_id,
-        len(codes),
-        type(pooling_output).__name__,
-        getattr(request, "is_finished", None),
     )
     _, left_context_frames = _codec_config(transfer_manager)
     context = [_MINICPMO45_SILENCE_CODE] * left_context_frames if codes else []
@@ -443,9 +438,6 @@ def tts2code2wav_token_only(
             )
         )
     logger.info(
-        "[DIAG-SYNC][CONSUMER-DRIVER] n_source_outputs=%s n_code2wav_inputs=%s",
-        len(source_outputs),
-        len(code2wav_inputs),
     )
     return code2wav_inputs
 

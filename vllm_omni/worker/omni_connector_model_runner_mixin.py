@@ -702,9 +702,24 @@ class OmniConnectorModelRunnerMixin:
         # returns its input unchanged under the same world_size<=1 condition,
         # so the original code path was a no-op here on every empty step.
         tp_group = self._get_local_tp_group()
-        if (
-            tp_group is None or getattr(tp_group, "world_size", 1) <= 1
-        ) and not self._full_payload_pending_broadcast_req_ids:
+        tp_world = getattr(tp_group, "world_size", 1) if tp_group is not None else 1
+        pending = len(self._full_payload_pending_broadcast_req_ids)
+        # Diagnostic (no-async-chunk NPU hang): surface the data-transfer-rank
+        # gate decision. Log at INFO only when it matters -- there is pending
+        # data to collect, or this rank is NOT the data-transfer rank (the exact
+        # condition that leaves a consumer stage parked). Otherwise stay quiet
+        # to avoid per-step log spam.
+        if pending or not self.is_data_transfer_rank():
+            logger.info(
+                "[DIAG-NOSYNC][CONSUMER-ENTER] stage=%s local_rank=%s is_data_transfer_rank=%s "
+                "tp_world=%s pending_bcast=%s",
+                self._stage_id,
+                self._local_rank,
+                self.is_data_transfer_rank(),
+                tp_world,
+                pending,
+            )
+        if (tp_group is None or tp_world <= 1) and not self._full_payload_pending_broadcast_req_ids:
             return None
         with self._lock:
             results = self._collect_full_payload_results_locked() if self.is_data_transfer_rank() else None
@@ -718,36 +733,8 @@ class OmniConnectorModelRunnerMixin:
             self._apply_staged_payloads_locked(results)
             for req_id, payload in results.items():
                 self._local_request_metadata[req_id] = self._extract_scheduling_metadata(payload)
-        # [DIAG-SYNC] inspect what the consumer actually received
-        for req_id, payload in results.items():
-            _diag_codes = None
-            _diag_finished = None
-            if isinstance(payload, dict):
-                _diag_codes = payload.get("codes")
-                _diag_meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
-                _diag_finished = _diag_meta.get("finished")
-            else:
-                _codes = getattr(payload, "codes", None)
-                _meta = getattr(payload, "meta", None)
-                _diag_codes = getattr(_codes, "audio", None)
-                _diag_finished = getattr(_meta, "finished", None)
-            if isinstance(_diag_codes, torch.Tensor):
-                _diag_code_len = int(_diag_codes.numel())
-            elif hasattr(_diag_codes, "__len__"):
-                _diag_code_len = len(_diag_codes)
-            else:
-                _diag_code_len = None
-            logger.info(
-                "[DIAG-SYNC][CONSUMER-RECV] stage=%s req=%s payload_type=%s has_codes=%s code_len=%s finished=%r",
-                self._stage_id,
-                req_id,
-                type(payload).__name__,
-                _diag_codes is not None,
-                _diag_code_len,
-                _diag_finished,
-            )
-        logger.debug(
-            "[Stage-%s] recv_full_payload_inputs: consumed %s reqs: %s, stage_recv_req_ids now=%s",
+        logger.info(
+            "[DIAG-NOSYNC][CONSUMER-RECV] stage=%s consumed=%s reqs=%s stage_recv_req_ids=%s",
             self._stage_id,
             len(results),
             list(results.keys()),
@@ -984,20 +971,23 @@ class OmniConnectorModelRunnerMixin:
         if self._omni_connector is None:
             logger.debug("[Stage-%s] send_full_payload_outputs: connector is None, skip", self._stage_id)
             return []
+        logger.info(
+            "[DIAG-NOSYNC][PRODUCER-ENTER] stage=%s local_rank=%s is_data_transfer_rank=%s "
+            "n_outputs=%s connector=%s",
+            self._stage_id,
+            self._local_rank,
+            self.is_data_transfer_rank(),
+            len(outputs),
+            type(self._omni_connector).__name__ if self._omni_connector is not None else None,
+        )
         if not self.is_data_transfer_rank():
-            logger.debug(
-                "[Stage-%s] send_full_payload_outputs: not data_transfer_rank (rank=%s), skip",
+            logger.info(
+                "[DIAG-NOSYNC][PRODUCER-SKIP] stage=%s local_rank=%s not data_transfer_rank, skipping send",
                 self._stage_id,
                 self._local_rank,
             )
             return list(outputs.keys())
         sent_ids: list[str] = []
-        logger.info(
-            "[DIAG-SYNC][PRODUCER-ENTER] stage=%s n_outputs=%s connector_ready=%s",
-            self._stage_id,
-            len(outputs),
-            self._omni_connector is not None,
-        )
         next_stage_id = self._next_stage_id
         for req_id, value in outputs.items():
             if isinstance(value, tuple) and len(value) == 2:
@@ -1034,36 +1024,6 @@ class OmniConnectorModelRunnerMixin:
                     code_len,
                     meta.get("left_context_size"),
                 )
-            # [DIAG-SYNC] producer payload inspection (dict or OmniPayloadStruct)
-            _diag_codes = None
-            _diag_finished = None
-            _diag_last_chunk = None
-            if isinstance(payload, dict):
-                _diag_codes = payload.get("codes")
-                _diag_meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
-                _diag_finished = _diag_meta.get("finished")
-                _diag_last_chunk = _diag_meta.get("last_chunk")
-            else:
-                _codes = getattr(payload, "codes", None)
-                _meta = getattr(payload, "meta", None)
-                _diag_codes = getattr(_codes, "audio", None)
-                _diag_finished = getattr(_meta, "finished", None)
-                _diag_last_chunk = getattr(_meta, "last_chunk", None)
-            if isinstance(_diag_codes, torch.Tensor):
-                _diag_code_len = int(_diag_codes.numel())
-            elif hasattr(_diag_codes, "__len__"):
-                _diag_code_len = len(_diag_codes)
-            else:
-                _diag_code_len = None
-            logger.info(
-                "[DIAG-SYNC][PRODUCER] stage=%s req=%s has_codes=%s code_len=%s finished=%r last_chunk=%r",
-                self._stage_id,
-                req_id,
-                _diag_codes is not None,
-                _diag_code_len,
-                _diag_finished,
-                _diag_last_chunk,
-            )
 
             external_req_id = self._resolve_external_req_id(request, req_id)
             chunk_id = self._put_req_chunk[req_id]
@@ -2333,12 +2293,16 @@ class OmniConnectorModelRunnerMixin:
         Ordinary stage payloads are TP-identical, so exactly one TP rank
         should talk to the connector. When TP is initialized, use TP rank 0
         so the connector leader matches TP-local broadcast source rank.
-        Otherwise fall back to LOCAL_RANK==0 for the single-rank case.
+        Otherwise (single rank per stage, e.g. TP=1 or uniproc) this rank is
+        the sole connector leader and MUST transfer data -- do NOT gate on
+        the global LOCAL_RANK env var, which is not reliably reset per stage
+        in multi-stage launches and would otherwise leave a consumer stage
+        permanently parked (see no-async-chunk NPU hang analysis).
         """
         tp_group = self._get_local_tp_group()
         if tp_group is not None and getattr(tp_group, "world_size", 1) > 1:
             return getattr(tp_group, "rank_in_group", 0) == 0
-        return self._local_rank == 0
+        return True
 
     def get_kv_connector_key(
         self,
