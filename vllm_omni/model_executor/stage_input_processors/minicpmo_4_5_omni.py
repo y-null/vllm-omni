@@ -351,8 +351,6 @@ def tts2code2wav_full_payload(
     internal_id = getattr(request, "request_id", None)
     request_id = str(external_id if external_id is not None else internal_id)
     codes = _extract_codec_delta(pooling_output, request_id)
-    logger.info(
-    )
     _, left_context_frames = _codec_config(transfer_manager)
     context = [_MINICPMO45_SILENCE_CODE] * left_context_frames if codes else []
     output_codes = [*context, *codes]

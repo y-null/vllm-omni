@@ -57,10 +57,8 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
             "DyninOmniForConditionalGeneration",
             "IndexTTS2S2MelDecoder",
             # MiniCPM-o-4.5 Code2Wav: full_payload consumer for --no-async-chunk.
-            # The scheduler parks these requests in WAITING_FOR_INPUT
-            # (omni_scheduling_coordinator._FULL_PAYLOAD_INPUT_STAGES); the
-            # worker must init the connector to receive the full payload and
-            # release the parked request, otherwise it hangs permanently.
+            # Scheduler parks it in WAITING_FOR_INPUT; the connector must be
+            # initialised to receive the payload and release the parked request.
             "MiniCPMO45Code2Wav",
         }
         if (

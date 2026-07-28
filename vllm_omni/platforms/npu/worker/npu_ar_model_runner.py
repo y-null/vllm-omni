@@ -126,8 +126,8 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin):
             "DyninOmniForConditionalGeneration",
             "IndexTTS2TalkerForConditionalGeneration",
             # MiniCPM-o-4.5 talker/AR: full_payload producer for --no-async-chunk.
-            # Must init the connector so send_full_payload_outputs can deliver
-            # the complete codec payload to the Code2Wav (stage 2) consumer.
+            # Connector must be initialised so send_full_payload_outputs can
+            # deliver the codec payload to the Code2Wav (stage 2) consumer.
             "MiniCPMO45OmniForConditionalGeneration",
         }
         if (
