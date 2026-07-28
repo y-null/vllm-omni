@@ -703,22 +703,6 @@ class OmniConnectorModelRunnerMixin:
         # so the original code path was a no-op here on every empty step.
         tp_group = self._get_local_tp_group()
         tp_world = getattr(tp_group, "world_size", 1) if tp_group is not None else 1
-        pending = len(self._full_payload_pending_broadcast_req_ids)
-        # Diagnostic (no-async-chunk NPU hang): surface the data-transfer-rank
-        # gate decision. Log at INFO only when it matters -- there is pending
-        # data to collect, or this rank is NOT the data-transfer rank (the exact
-        # condition that leaves a consumer stage parked). Otherwise stay quiet
-        # to avoid per-step log spam.
-        if pending or not self.is_data_transfer_rank():
-            logger.info(
-                "[DIAG-NOSYNC][CONSUMER-ENTER] stage=%s local_rank=%s is_data_transfer_rank=%s "
-                "tp_world=%s pending_bcast=%s",
-                self._stage_id,
-                self._local_rank,
-                self.is_data_transfer_rank(),
-                tp_world,
-                pending,
-            )
         if (tp_group is None or tp_world <= 1) and not self._full_payload_pending_broadcast_req_ids:
             return None
         with self._lock:
@@ -733,13 +717,6 @@ class OmniConnectorModelRunnerMixin:
             self._apply_staged_payloads_locked(results)
             for req_id, payload in results.items():
                 self._local_request_metadata[req_id] = self._extract_scheduling_metadata(payload)
-        logger.info(
-            "[DIAG-NOSYNC][CONSUMER-RECV] stage=%s consumed=%s reqs=%s stage_recv_req_ids=%s",
-            self._stage_id,
-            len(results),
-            list(results.keys()),
-            self._stage_recv_req_ids,
-        )
         return results
 
     def _get_model_config(self) -> Any:
@@ -971,21 +948,7 @@ class OmniConnectorModelRunnerMixin:
         if self._omni_connector is None:
             logger.debug("[Stage-%s] send_full_payload_outputs: connector is None, skip", self._stage_id)
             return []
-        logger.info(
-            "[DIAG-NOSYNC][PRODUCER-ENTER] stage=%s local_rank=%s is_data_transfer_rank=%s "
-            "n_outputs=%s connector=%s",
-            self._stage_id,
-            self._local_rank,
-            self.is_data_transfer_rank(),
-            len(outputs),
-            type(self._omni_connector).__name__ if self._omni_connector is not None else None,
-        )
         if not self.is_data_transfer_rank():
-            logger.info(
-                "[DIAG-NOSYNC][PRODUCER-SKIP] stage=%s local_rank=%s not data_transfer_rank, skipping send",
-                self._stage_id,
-                self._local_rank,
-            )
             return list(outputs.keys())
         sent_ids: list[str] = []
         next_stage_id = self._next_stage_id

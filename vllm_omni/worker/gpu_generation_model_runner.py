@@ -68,6 +68,9 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             "CosyVoice3Model",
             "DyninOmniForConditionalGeneration",
             "IndexTTS2S2MelDecoder",
+            # MiniCPM-o-4.5 Code2Wav: full_payload consumer for --no-async-chunk
+            # (see omni_scheduling_coordinator._FULL_PAYLOAD_INPUT_STAGES).
+            "MiniCPMO45Code2Wav",
         }
         if (
             getattr(self.model_config, "model_arch", None) in _OMNI_CONNECTOR_INIT_ARCHS

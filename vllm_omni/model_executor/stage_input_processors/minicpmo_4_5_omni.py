@@ -437,8 +437,6 @@ def tts2code2wav_token_only(
                 mm_processor_kwargs=None,
             )
         )
-    logger.info(
-    )
     return code2wav_inputs
 
 

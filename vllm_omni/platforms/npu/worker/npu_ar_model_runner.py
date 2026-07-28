@@ -47,6 +47,7 @@ from vllm_omni.distributed.omni_connectors.utils.config import stage_sends_async
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
 from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, to_payload_element
+from vllm_omni.distributed.omni_connectors.utils.config import get_stage_connector_role
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 from vllm_omni.worker.sampling_utils import sanitize_min_tokens_stop_ids
 
@@ -124,8 +125,15 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin):
             "CosyVoice3Model",
             "DyninOmniForConditionalGeneration",
             "IndexTTS2TalkerForConditionalGeneration",
+            # MiniCPM-o-4.5 talker/AR: full_payload producer for --no-async-chunk.
+            # Must init the connector so send_full_payload_outputs can deliver
+            # the complete codec payload to the Code2Wav (stage 2) consumer.
+            "MiniCPMO45OmniForConditionalGeneration",
         }
-        if getattr(self.model_config, "model_arch", None) in _OMNI_CONNECTOR_INIT_ARCHS:
+        if (
+            getattr(self.model_config, "model_arch", None) in _OMNI_CONNECTOR_INIT_ARCHS
+            or get_stage_connector_role(self.model_config) is not None
+        ):
             self.init_omni_connectors(
                 model_config=self.model_config,
                 kv_transfer_manager=self.kv_transfer_manager,

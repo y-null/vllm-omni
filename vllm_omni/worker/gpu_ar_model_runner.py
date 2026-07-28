@@ -324,6 +324,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             "CosyVoice3Model",
             "DyninOmniForConditionalGeneration",
             "IndexTTS2TalkerForConditionalGeneration",
+            # MiniCPM-o-4.5 talker/AR: full_payload producer for --no-async-chunk.
+            "MiniCPMO45OmniForConditionalGeneration",
         }
         if (
             getattr(self.model_config, "model_arch", None) in _OMNI_CONNECTOR_INIT_ARCHS

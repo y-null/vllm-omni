@@ -36,6 +36,7 @@ from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.platforms.npu.worker.npu_ar_model_runner import ExecuteModelState, _ensure_tensor_values
 from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
 from vllm_omni.utils.mm_outputs import partition_payload_list
+from vllm_omni.distributed.omni_connectors.utils.config import get_stage_connector_role
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 
@@ -55,8 +56,17 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
             "CosyVoice3Model",
             "DyninOmniForConditionalGeneration",
             "IndexTTS2S2MelDecoder",
+            # MiniCPM-o-4.5 Code2Wav: full_payload consumer for --no-async-chunk.
+            # The scheduler parks these requests in WAITING_FOR_INPUT
+            # (omni_scheduling_coordinator._FULL_PAYLOAD_INPUT_STAGES); the
+            # worker must init the connector to receive the full payload and
+            # release the parked request, otherwise it hangs permanently.
+            "MiniCPMO45Code2Wav",
         }
-        if getattr(self.model_config, "model_arch", None) in _OMNI_CONNECTOR_INIT_ARCHS:
+        if (
+            getattr(self.model_config, "model_arch", None) in _OMNI_CONNECTOR_INIT_ARCHS
+            or get_stage_connector_role(self.model_config) is not None
+        ):
             self.init_omni_connectors(
                 model_config=self.model_config,
             )
