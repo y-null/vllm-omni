@@ -50,18 +50,6 @@ _MAX_EVENT_BYTES = 15 * 1024 * 1024
 class DuplexSessionRunnerMixin:
     """Run one ordered WebSocket mailbox for a duplex session."""
 
-    def _should_recover_unanswered_speech(self, session: DuplexSession) -> bool:
-        """Force a response when buffered speech would otherwise go unanswered.
-
-        The model owns the duplex turn policy, so it can answer one question and
-        then settle into listen without ever responding to speech that arrived
-        while it was still speaking: the native overlap detector only arms while a
-        response is already active. When a commit carries speech *after* a
-        response has already been produced, reserve a response up front so the
-        remaining user speech still gets an answer instead of being dropped.
-        """
-        return session.active_response_id is None and session.last_response_id is not None
-
     async def handle_session(
         self,
         websocket: WebSocket,
@@ -1799,7 +1787,7 @@ class DuplexSessionRunnerMixin:
                                         "duplex_turn_id": data_plane_turn_id,
                                     },
                                     final=True,
-                                    precreate_response=self._should_recover_unanswered_speech(session),
+                                    precreate_response=False,
                                     operation_id=commit_reservation.operation_id,
                                     retained_committed_payload=final_payload,
                                 )
