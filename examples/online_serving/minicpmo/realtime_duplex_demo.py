@@ -165,23 +165,6 @@ def _event_count_after(
     return sum(event.get("type") == event_type for event in events[index + 1 :])
 
 
-def _has_listen_after_last_done(events: list[dict[str, object]]) -> bool:
-    """True once the model settles back into listen after its latest response.
-
-    A duplex response does not end the turn when ``response.done`` arrives: the
-    model owns the turn policy and only returns to its listening steady state
-    with a later ``response.listen``. Closing the session before that signal
-    truncates the event stream and loses the final listen.
-    """
-    last_done_index = -1
-    for index, event in enumerate(events):
-        if event.get("type") == "response.done":
-            last_done_index = index
-    if last_done_index < 0:
-        return False
-    return any(event.get("type") == "response.listen" for event in events[last_done_index + 1 :])
-
-
 def _probe_video_frames_and_fps(video_path: Path) -> tuple[int, float]:
     """Frame count and average FPS via PyAV (same approach as Daily-Omni)."""
     import av
@@ -490,19 +473,6 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
                 post_commit_decision = _post_commit_model_decision(client.events.events, committed_index)
         except TimeoutError as exc:
             wait_error = str(exc)
-        if post_commit_decision == "speak":
-            # The model owns the duplex turn policy, so a spoken response does not
-            # end the turn: it only settles back to listening with a later
-            # response.listen. Give that steady-state signal a short bounded window
-            # before closing so the recorded stream keeps the final listen.
-            try:
-                await wait_for(
-                    lambda: _has_listen_after_last_done(client.events.events),
-                    timeout_s=max(1.0, 2.0 * _chunk_period_ms(client.events.events) / 1000.0),
-                    label="post-response listen steady state",
-                )
-            except TimeoutError:
-                pass
         await client.acknowledge_playback()
         close_error: str | None = None
         try:
