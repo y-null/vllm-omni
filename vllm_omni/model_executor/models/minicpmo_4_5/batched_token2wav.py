@@ -502,6 +502,7 @@ class BatchedToken2Wav(nn.Module):
                 graph_att,
                 cnn_out,
                 att_out,
+                attn_mask,
             )
         if valid_lengths is not None:
             if not hasattr(estimator, "in_proj"):
@@ -696,6 +697,20 @@ class BatchedToken2Wav(nn.Module):
                 device=mu.device,
             )
             attn_mask = valid_queries.unsqueeze(2) & torch.cat((current_keys, old_keys), dim=2)
+        elif pad_frames:
+            # Mask the padded keys instead of only zeroing their content: a
+            # zero-valued key/value pair still takes probability mass out of the
+            # softmax denominator, so the real frames keep attending to the
+            # padding unless it is explicitly excluded.
+            kv_len = int(mu.shape[2]) + offset
+            attn_mask = torch.ones(
+                2 * batch_size,
+                int(mu.shape[2]),
+                kv_len,
+                dtype=torch.bool,
+                device=mu.device,
+            )
+            attn_mask[:, :, mel_frames : mel_frames + pad_frames] = False
         next_cnn: list[torch.Tensor] = []
         next_att_cache: torch.Tensor | None = None
         ragged_att_cache: list[torch.Tensor] | None = None

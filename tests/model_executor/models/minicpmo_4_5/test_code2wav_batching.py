@@ -523,7 +523,7 @@ def test_cfm_graph_receives_bfloat16_cache_in_compute_dtype():
     seen_dtypes: list[torch.dtype] = []
 
     class RecordingGraph:
-        def replay(self, estimator_input, time_embedding, cnn_cache, att_cache, cnn_out, att_out):
+        def replay(self, estimator_input, time_embedding, cnn_cache, att_cache, cnn_out, att_out, attn_mask=None):
             del time_embedding, cnn_cache
             seen_dtypes.append(att_cache.dtype)
             return estimator_input[:, :1], cnn_out, att_out
