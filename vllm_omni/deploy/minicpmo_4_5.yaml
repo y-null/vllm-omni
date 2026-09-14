@@ -40,6 +40,9 @@ stages:
     # Perf #19: stage-level prefix-caching override (top-level stays false
     # for duplex safety; stage0 benefits from each request own prefixes).
     enable_prefix_caching: true
+    # Perf #14 companion: async scheduling is incompatible with ngram
+    # speculative decoding in the current VllmConfig validation.
+    async_scheduling: false
     # Perf #14: ngram speculative decoding for stage0 (prompt lookup).
     # Verified speculative tokens keep temperature=0 outputs identical.
     speculative_config:
