@@ -96,6 +96,29 @@ def _zero_padded_frames(tensor: torch.Tensor, valid_frames: int | None) -> None:
     tensor[..., valid_frames:] = 0.0
 
 
+def _zero_padded_cnn_cache(
+    cnn_cache: torch.Tensor,
+    estimator: nn.Module,
+    pad_frames: int,
+) -> None:
+    """Clear the cache positions that come from padded frames, in place.
+
+    Each block's CNN cache holds the tail of its convolution output
+    (``new_cnn_cache = x[..., -causal_padding[0]:]``, inside ``stepaudio2``),
+    so when the padding sits at the chunk tail those positions are
+    padding-derived and would otherwise become the next chunk's left context.
+    Padding is at most ``pad_frames`` wide, so only the trailing positions that
+    can come from it are cleared; the valid part of the window is kept.
+    """
+    for index, block in enumerate(estimator.blocks):
+        width = int(block.conv.block[1].causal_padding[0])
+        if width <= 0:
+            continue
+        zero_from = max(0, width - pad_frames)
+        if zero_from < width:
+            cnn_cache[index][..., zero_from:] = 0.0
+
+
 def plan_token2wav_encode_slices(
     num_frames: int,
     *,
@@ -650,9 +673,11 @@ class BatchedToken2Wav(nn.Module):
             ),
         )
         if pad_frames:
-            # See _cfm_pad_frames: the caches also advance by the padded width.
-            mu = torch.nn.functional.pad(mu, (0, pad_frames))
-            cond = torch.nn.functional.pad(cond, (0, pad_frames))
+            # Replicate rather than zero: a repeated last frame is a closer
+            # continuation of the chunk than silence, so the padded positions
+            # carry less of a step change into the attention and CNN caches.
+            mu = torch.nn.functional.pad(mu, (0, pad_frames), mode="replicate")
+            cond = torch.nn.functional.pad(cond, (0, pad_frames), mode="replicate")
         end = offset + int(mu.shape[2])
         if end > int(decoder.rand_noise.shape[2]):
             raise RuntimeError(
@@ -717,6 +742,8 @@ class BatchedToken2Wav(nn.Module):
                     valid_lengths=valid_lengths,
                     valid_frames=mel_frames if pad_frames else None,
                 )
+                if pad_frames:
+                    _zero_padded_cnn_cache(step_cnn, estimator, pad_frames)
                 conditional, unconditional = estimate.split(batch_size, dim=0)
                 velocity = (1.0 + decoder.inference_cfg_rate) * conditional - decoder.inference_cfg_rate * unconditional
                 x = x + dt * velocity
