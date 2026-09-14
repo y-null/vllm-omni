@@ -37,6 +37,9 @@ stages:
     # Leave headroom on the shared GPU for Talker KV + concurrent Code2Wav.
     gpu_memory_utilization: 0.55
     enforce_eager: false
+    # Perf #19: stage-level prefix-caching override (top-level stays false
+    # for duplex safety; stage0 benefits from each request own prefixes).
+    enable_prefix_caching: true
     tensor_parallel_size: 1
     max_num_batched_tokens: 16384
     devices: "0"
@@ -95,7 +98,7 @@ stages:
   - stage_id: 2
     max_num_seqs: 4
     gpu_memory_utilization: 0.18
-    enforce_eager: true
+    enforce_eager: false
     enable_chunked_prefill: false
     max_num_batched_tokens: 65536
     max_model_len: 65536
@@ -128,7 +131,10 @@ platforms:
       - stage_id: 1
         max_num_batched_tokens: 8192
         compilation_config:
-          cudagraph_mode: PIECEWISE
+          cudagraph_mode: FULL_AND_PIECEWISE
+          # Perf #15: FULL_AND_PIECEWISE keeps in-graph sampling / K-step alive.
+          cudagraph_capture_sizes: [1, 2, 4, 8, 16, 24, 32]
+          max_cudagraph_capture_size: 32
       - stage_id: 2
         # Stage 2 stays outer-eager and captures only exact-shape CFM DiT
         # estimator kernels through the NPU platform patch.
