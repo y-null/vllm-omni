@@ -150,4 +150,7 @@ platforms:
         # estimator kernels through the NPU platform patch.
         additional_config:
           code2wav_enable_npu_graph: true
+    # Perf #13: cut CFM ODE steps from 10 to 3 (biggest single lever;
+    # audio-quality gate: seed-tts CER must not regress).
+          token2wav_n_timesteps: 3
           code2wav_max_npu_graphs: 32
