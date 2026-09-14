@@ -40,6 +40,13 @@ stages:
     # Perf #19: stage-level prefix-caching override (top-level stays false
     # for duplex safety; stage0 benefits from each request own prefixes).
     enable_prefix_caching: true
+    # Perf #14: ngram speculative decoding for stage0 (prompt lookup).
+    # Verified speculative tokens keep temperature=0 outputs identical.
+    speculative_config:
+      method: ngram
+      num_speculative_tokens: 15
+      prompt_lookup_min: 1
+      prompt_lookup_max: 1
     tensor_parallel_size: 1
     max_num_batched_tokens: 16384
     devices: "0"
