@@ -20,8 +20,11 @@ connectors:
       connector_get_sleep_s: 0.01
       connector_get_max_wait_first_chunk: 3000
       connector_get_max_wait: 300
-      codec_chunk_frames: 25
+      codec_chunk_frames: 32
       codec_left_context_frames: 3
+      # Perf #23: larger steady-state chunks amortize per-chunk overhead
+      # (entry_02 value; first chunk equals steady chunk).
+      initial_codec_chunk_frames: 32
       # HiFT capture buckets are derived from codec_chunk_frames and
       # codec_left_context_frames. (#5869)
       # A future initial_codec_chunk_frames shape will use lazy capture unless
