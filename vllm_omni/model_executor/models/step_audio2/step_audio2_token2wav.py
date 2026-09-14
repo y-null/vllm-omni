@@ -95,6 +95,30 @@ class _ConvRNNF0Predictor(nn.Module):
         return self.classifier(self.condnet(x).transpose(1, 2)).squeeze(-1).abs()
 
 
+def _fold_weight_norm_modules(root: nn.Module, name: str) -> int:
+    """Perf #17: materialize weight_norm parametrizations into plain weights.
+
+    weight_norm recomputes ``g * v / ||v||`` on every forward; after
+    load_state_dict the value is constant. Folding it once at load time is a
+    mathematical identity (bitwise-identical outputs) and removes the
+    per-call recompute from every inference step.
+    """
+    folded = 0
+    for module in root.modules():
+        parametrizations = getattr(module, "parametrizations", None)
+        if parametrizations is not None and "weight" in parametrizations:
+            from torch.nn.utils import parametrize
+
+            parametrize.remove_parametrizations(module, "weight")
+            folded += 1
+        elif hasattr(module, "weight_g") and hasattr(module, "weight_v"):
+            from torch.nn.utils import remove_weight_norm
+
+            remove_weight_norm(module)
+            folded += 1
+    return folded
+
+
 def _build_hift() -> HiFTGenerator:
     return HiFTGenerator(
         sampling_rate=24000,
@@ -190,6 +214,11 @@ class StepAudio2Token2WavCore(nn.Module):
         }
         self._hift.load_state_dict(hift_state_dict, strict=True)
         self._hift.to(self.device).eval()
+
+        # Perf #17: fold weight_norm in flow + HiFT once at load time
+        # (bitwise-identical, removes per-forward constant recompute).
+        _fold_weight_norm_modules(self._flow, "flow")
+        _fold_weight_norm_modules(self._hift, "hift")
 
         self._models_loaded = True
         logger.info("Token2Wav models loaded successfully")
