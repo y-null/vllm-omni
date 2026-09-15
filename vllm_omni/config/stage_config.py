@@ -748,6 +748,66 @@ def resolve_deploy_yaml(path: str | Path) -> dict[str, Any]:
     return merged
 
 
+_MINICPMO_GRAPH_STAGES = (0, 1)
+_MINICPMO_CUDAGRAPH_ENV = "VLLM_OMNI_MINICPMO_CUDAGRAPH_MODE"
+
+
+def _apply_minicpmo_cudagraph_default(deploy: "DeployConfig") -> None:
+    """Force FULL_DECODE_ONLY for MiniCPM-o decode stages on Ascend.
+
+    Perf T1 (entry_21): the shipped minicpmo_4_5.yaml pins PIECEWISE for stages
+    0 and 1, and under FULL_DECODE_ONLY the captured decode step stops
+    re-issuing attention per layer per step. Measured output-neutral:
+        A2/910B3, cards swapped   0.3737 (FULL) / 0.5543 (PIECEWISE)
+        A3/910C, dies swapped     0.2553 / 0.2410 (FULL) vs 0.3198 / 0.3216
+    Set VLLM_OMNI_MINICPMO_CUDAGRAPH_MODE to another mode to restore config.
+    """
+    import os
+
+    mode = os.environ.get(_MINICPMO_CUDAGRAPH_ENV, "FULL_DECODE_ONLY").strip()
+    if not mode:
+        return
+    for stage in deploy.stages:
+        if stage.stage_id not in _MINICPMO_GRAPH_STAGES:
+            continue
+        current = dict(stage.compilation_config or {})
+        if current.get("cudagraph_mode") == mode:
+            continue
+        if current.get("cudagraph_mode") is not None:
+            logger.info(
+                "[minicpmo] stage %s cudagraph_mode %s -> %s (measured 25-33%% RTF on Ascend; "
+                "set %s to override)",
+                stage.stage_id,
+                current.get("cudagraph_mode"),
+                mode,
+                _MINICPMO_CUDAGRAPH_ENV,
+            )
+        current["cudagraph_mode"] = mode
+        stage.compilation_config = current
+
+
+def _apply_minicpmo_perf_defaults(deploy: "DeployConfig") -> None:
+    """Apply MiniCPM-o perf code-defaults, scoped to this pipeline on NPU."""
+    model_type = None
+    for attr in ("pipeline", "pipeline_config"):
+        obj = getattr(deploy, attr, None)
+        if obj is not None:
+            model_type = getattr(obj, "model_type", None)
+            if model_type:
+                break
+    if model_type != "minicpmo_4_5":
+        return
+    try:
+        from vllm_omni.platforms import current_omni_platform
+
+        device_name = getattr(current_omni_platform, "device_name", None)
+    except Exception:
+        return
+    if (device_name or "").lower() != "npu":
+        return
+    _apply_minicpmo_cudagraph_default(deploy)
+
+
 def load_deploy_config(path: str | Path) -> DeployConfig:
     """Load a deploy YAML (with optional base_config inheritance)."""
     raw_dict = resolve_deploy_yaml(path)
@@ -785,7 +845,9 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
     ):
         if name in raw_dict:
             kwargs[name] = raw_dict[name]
-    return DeployConfig(**kwargs)
+    deploy = DeployConfig(**kwargs)
+    _apply_minicpmo_perf_defaults(deploy)
+    return deploy
 
 
 class PlatformOverrides(NamedTuple):
