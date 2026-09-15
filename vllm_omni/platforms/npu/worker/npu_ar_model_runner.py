@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import time
 from collections.abc import Mapping
@@ -113,7 +114,17 @@ class ExecuteModelState(NamedTuple):
 class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, DuplexSamplingRunnerMixin):
     """Autoregressive NPU model runner that returns hidden states per request."""
 
+    # vllm-ascend's ascend-graph wrapper reads this flag from the runner, but
+    # the vllm-ascend build this image ships never sets it -- the fixed-KV
+    # capture path would raise AttributeError without a default here.
+    enable_hamming_sparse: bool = False
+
     def __init__(self, *args, **kwargs):
+        from vllm_omni.platforms.npu.attention import fixed_kv_decode
+
+        # Before parent init: vLLM's selector uses current_platform
+        # (vllm-ascend), not NPUOmniPlatform.get_attn_backend_cls.
+        fixed_kv_decode.install_into_ascend_backend()
         super().__init__(*args, **kwargs)
         self.input_ids = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
         # each model stage has their own hidden size
@@ -136,6 +147,69 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
     def load_model(self, *args, **kwargs) -> None:
         super().load_model(*args, **kwargs)
         self._resolve_duplex_sampling_hook(force=True)
+
+    @contextlib.contextmanager
+    def _narrow_decode_query_len(self):
+        """One query row per decode graph, for the duration of the block.
+
+        Multi-frame replay reads one row of its graph, and a K-query replay costs
+        ~0.6 ms more than a one-query one. Without the multi-frame loop engaged
+        (``narrow_replay_enabled`` false) this is a no-op, so the wide capture
+        path stays exactly as before."""
+        from vllm_omni.platforms.npu.worker import talker_multiframe
+
+        saved = int(getattr(self, "uniform_decode_query_len", 1) or 1)
+        if saved <= 1 or not talker_multiframe.narrow_replay_enabled(self):
+            yield
+            return
+        logger.info("[minicpmo] the Talker's decode graphs are one query row wide, not %d", saved)
+        dispatcher = getattr(self, "cudagraph_dispatcher", None)
+        dispatcher_saved = getattr(dispatcher, "uniform_decode_query_len", None)
+        self.uniform_decode_query_len = 1
+        if dispatcher_saved is not None:
+            dispatcher.uniform_decode_query_len = 1
+        try:
+            yield
+        finally:
+            self.uniform_decode_query_len = saved
+            if dispatcher_saved is not None:
+                dispatcher.uniform_decode_query_len = dispatcher_saved
+
+    def _check_and_update_cudagraph_mode(self, *args, **kwargs):
+        """Register the dispatcher's decode keys one query row wide, not K."""
+        with self._narrow_decode_query_len():
+            return super()._check_and_update_cudagraph_mode(*args, **kwargs)
+
+    def _capture_cudagraphs(self, *args, **kwargs):
+        """Capture fixed-KV decode graphs per KV capacity bucket (perf T2).
+
+        Each bucket needs its own pass: the default path leaves the capacity unset
+        and would file the graphs under a key decode never looks up. Signature is
+        fully forwarded ("*args/**kwargs") because the upstream parent takes an
+        extra ``profiler`` argument that this override must not swallow."""
+        from vllm.config import CUDAGraphMode
+
+        from vllm_omni.platforms.npu.attention import fixed_kv_decode
+
+        runtime_mode = kwargs.get("cudagraph_runtime_mode")
+        if runtime_mode is None and len(args) >= 2:
+            runtime_mode = args[1]
+        buckets: tuple[int, ...] = ()
+        if runtime_mode == CUDAGraphMode.FULL:
+            buckets = fixed_kv_decode.buckets_for(
+                fixed_kv_decode.capacity_for(
+                    self.vllm_config.model_config.max_model_len,
+                    self.vllm_config.cache_config.block_size,
+                ),
+                self.vllm_config.cache_config.block_size,
+            )
+        if not buckets:
+            return super()._capture_cudagraphs(*args, **kwargs)
+        with self._narrow_decode_query_len():
+            for capacity in sorted(buckets, reverse=True):
+                logger.info("[minicpmo] capturing fixed-KV decode graphs at kv_capacity=%d", capacity)
+                with fixed_kv_decode.capturing_bucket(capacity):
+                    super()._capture_cudagraphs(*args, **kwargs)
 
     def _dummy_run(self, *args, **kwargs):
         """A dummy run rewrites the shared input buffers without going through
