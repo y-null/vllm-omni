@@ -1,0 +1,177 @@
+{
+  "binList": [
+    {
+      "implMode": "high_performance",
+      "int64Mode": false,
+      "simplifiedKeyMode": 0,
+      "simplifiedKey": [
+        "TalkerCodecSampleAdvance/d=0,p=1/0,2/0,2/3,2/3,2/3,2/12,2/3,2/3,2/3,2/3,2/3,2/12,2/12,2",
+        "TalkerCodecSampleAdvance/d=0,p=0/0,2/0,2/3,2/3,2/3,2/12,2/3,2/3,2/3,2/3,2/3,2/12,2/12,2",
+        "TalkerCodecSampleAdvance/d=1,p=1/0,2/0,2/3,2/3,2/3,2/12,2/3,2/3,2/3,2/3,2/3,2/12,2/12,2",
+        "TalkerCodecSampleAdvance/d=1,p=0/0,2/0,2/3,2/3,2/3,2/12,2/3,2/3,2/3,2/3,2/3,2/12,2/12,2"
+      ],
+      "staticKey": "e067b25019195785730057a8d451a7a8e560b51f42f5c337652b7808b1733580,3e35b7bf50b5ec03693f93c67b7a5a40baa5f0cfcd6f048d43c32f186f88b803",
+      "inputs": [
+        {
+          "name": "logits",
+          "index": 0,
+          "dtype": "float32",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        },
+        {
+          "name": "noise",
+          "index": 1,
+          "dtype": "float32",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        },
+        {
+          "name": "history",
+          "index": 2,
+          "dtype": "int32",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        },
+        {
+          "name": "history_len",
+          "index": 3,
+          "dtype": "int32",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        },
+        {
+          "name": "step",
+          "index": 4,
+          "dtype": "int32",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        },
+        {
+          "name": "finished",
+          "index": 5,
+          "dtype": "bool",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        },
+        {
+          "name": "max_tokens",
+          "index": 6,
+          "dtype": "int32",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "sampled",
+          "index": 0,
+          "dtype": "int32",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        },
+        {
+          "name": "next_history",
+          "index": 1,
+          "dtype": "int32",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        },
+        {
+          "name": "next_history_len",
+          "index": 2,
+          "dtype": "int32",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        },
+        {
+          "name": "next_step",
+          "index": 3,
+          "dtype": "int32",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        },
+        {
+          "name": "finished_out",
+          "index": 4,
+          "dtype": "bool",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        },
+        {
+          "name": "emit",
+          "index": 5,
+          "dtype": "bool",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        }
+      ],
+      "attrs": [
+        {
+          "name": "eos_token_id",
+          "dtype": "int",
+          "value": 0
+        }
+      ],
+      "opMode": "dynamic",
+      "optionalInputMode": "gen_placeholder",
+      "deterministic": "ignore",
+      "optionalOutputMode": "gen_placeholder",
+      "binInfo": {
+        "jsonFilePath": "ascend910_93/talker_codec_sample_advance/TalkerCodecSampleAdvance_0093ede3b895e435cb622dcd16c26448.json"
+      }
+    }
+  ]
+}

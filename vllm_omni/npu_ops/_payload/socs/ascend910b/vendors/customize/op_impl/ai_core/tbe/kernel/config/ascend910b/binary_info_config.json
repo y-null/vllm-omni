@@ -1,0 +1,95 @@
+{
+  "TalkerCodecLogitsPrepare": {
+    "dynamicRankSupport": true,
+    "simplifiedKeyMode": 0,
+    "optionalInputMode": "gen_placeholder",
+    "optionalOutputMode": "gen_placeholder",
+    "params": {
+      "inputs": [
+        {
+          "name": "raw_logits",
+          "index": 0,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "history",
+          "index": 1,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "history_len",
+          "index": 2,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "step",
+          "index": 3,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "min_tokens",
+          "index": 4,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "temperature",
+          "index": 5,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        },
+        {
+          "name": "repetition_penalty",
+          "index": 6,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "warped_logits",
+          "index": 0,
+          "paramType": "required",
+          "formatMode": "static_nd_agnostic"
+        }
+      ],
+      "attrs": [
+        {
+          "name": "vocab_size"
+        },
+        {
+          "name": "eos_token_id"
+        },
+        {
+          "name": "history_window"
+        },
+        {
+          "name": "top_k"
+        },
+        {
+          "name": "top_p"
+        },
+        {
+          "name": "min_tokens_to_keep"
+        }
+      ]
+    },
+    "binaryList": [
+      {
+        "coreType": 2,
+        "simplifiedKey": [
+          "TalkerCodecLogitsPrepare/d=0,p=1/0,2/3,2/3,2/3,2/3,2/0,2/0,2/0,2",
+          "TalkerCodecLogitsPrepare/d=0,p=0/0,2/3,2/3,2/3,2/3,2/0,2/0,2/0,2",
+          "TalkerCodecLogitsPrepare/d=1,p=1/0,2/3,2/3,2/3,2/3,2/0,2/0,2/0,2",
+          "TalkerCodecLogitsPrepare/d=1,p=0/0,2/3,2/3,2/3,2/3,2/0,2/0,2/0,2"
+        ],
+        "binPath": "ascend910b/talker_codec_logits_prepare/TalkerCodecLogitsPrepare_d1627b0d0b3638c734ae3dab46aa6d3a.o",
+        "jsonPath": "ascend910b/talker_codec_logits_prepare/TalkerCodecLogitsPrepare_d1627b0d0b3638c734ae3dab46aa6d3a.json"
+      }
+    ]
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "bridge": "_vllm_omni_a14_prepare_npu.cpython-312-aarch64-linux-gnu.so",
+  "operator": "TalkerCodecLogitsPrepare",
+  "schema_version": 3,
+  "soc": "ascend910b",
+  "vendor": "customize"
+}

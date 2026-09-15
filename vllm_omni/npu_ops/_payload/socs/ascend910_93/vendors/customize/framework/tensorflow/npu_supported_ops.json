@@ -1,0 +1,26 @@
+{
+  "TalkerCodecLogitsPrepare": {
+    "isGray": false,
+    "isHeavy": false
+  },
+  "TalkerDecodeAttention": {
+    "isGray": false,
+    "isHeavy": false
+  },
+  "TalkerGemv": {
+    "isGray": false,
+    "isHeavy": false
+  },
+  "83e24961b1df9b1e02cf7d44ab198a3696cf6fd5d89b743a7ef33ebf4ef91b88_TalkerCodecLogitsPrepare": {
+    "isGray": false,
+    "isHeavy": false
+  },
+  "b26ce0b15abb78ac9897d4799faed5d452bd66b0d8adfe42feca4367570420f2_TalkerDecodeAttention": {
+    "isGray": false,
+    "isHeavy": false
+  },
+  "71ed7ead186b76c7495d26d7c212f6115b82a5dd3ee5de3168f07baaa0752f33_TalkerGemv": {
+    "isGray": false,
+    "isHeavy": false
+  }
+}

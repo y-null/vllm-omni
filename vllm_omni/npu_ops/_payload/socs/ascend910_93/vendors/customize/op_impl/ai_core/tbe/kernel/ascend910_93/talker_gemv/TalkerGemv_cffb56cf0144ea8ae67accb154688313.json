@@ -1,0 +1,91 @@
+{
+ "binFileName": "TalkerGemv_cffb56cf0144ea8ae67accb154688313",
+ "binFileSuffix": ".o",
+ "blockDim": -1,
+ "coreType": "VectorCore",
+ "core_type": "AIV",
+ "intercoreSync": 0,
+ "kernelName": "TalkerGemv_cffb56cf0144ea8ae67accb154688313",
+ "magic": "RT_DEV_BINARY_MAGIC_ELF_AIVEC",
+ "memoryStamping": [],
+ "opParaSize": 24,
+ "parameters": [
+  null,
+  null,
+  null,
+  null
+ ],
+ "sha256": "34418813b7c97bae0595bbd7baf9e1f010efdd76cf926307739c2909bd976500",
+ "workspace": {
+  "num": 1,
+  "size": [
+   -1
+  ],
+  "type": [
+   0
+  ]
+ },
+ "kernelList": [
+  {
+   "kernelName": "TalkerGemv_cffb56cf0144ea8ae67accb154688313_0"
+  }
+ ],
+ "optionalInputMode": "gen_placeholder",
+ "optionalOutputMode": "gen_placeholder",
+ "supportSuperKernel": 1,
+ "compileInfo": {},
+ "supportInfo": {
+  "implMode": "high_performance",
+  "int64Mode": false,
+  "simplifiedKeyMode": 0,
+  "simplifiedKey": [
+   "TalkerGemv/d=0,p=1/27,2/27,2/27,2",
+   "TalkerGemv/d=0,p=0/27,2/27,2/27,2",
+   "TalkerGemv/d=1,p=1/27,2/27,2/27,2",
+   "TalkerGemv/d=1,p=0/27,2/27,2/27,2"
+  ],
+  "optionalInputMode": "gen_placeholder",
+  "optionalOutputMode": "gen_placeholder",
+  "staticKey": "dc766b3952a8be4cb1221b9c67110c5690e3531f95681a731cf9778a603d5cf2,6e574c20a066b3f7d982ef281c86da7d13b377e29fbd1bc09f34b574cf29a16b",
+  "inputs": [
+   {
+    "name": "x",
+    "index": 0,
+    "dtype": "bfloat16",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "weight",
+    "index": 1,
+    "dtype": "bfloat16",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   }
+  ],
+  "outputs": [
+   {
+    "name": "y",
+    "index": 0,
+    "dtype": "bfloat16",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   }
+  ],
+  "opMode": "dynamic",
+  "deterministic": "ignore"
+ },
+ "filePath": "ascend910_93/talker_gemv/TalkerGemv_cffb56cf0144ea8ae67accb154688313.json"
+}

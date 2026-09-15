@@ -1,0 +1,110 @@
+{
+  "binList": [
+    {
+      "implMode": "high_performance",
+      "int64Mode": false,
+      "simplifiedKeyMode": 0,
+      "simplifiedKey": [
+        "TalkerDecodeAttention/d=0,p=1/27,2/27,2/27,2/3,2/3,2/27,2",
+        "TalkerDecodeAttention/d=0,p=0/27,2/27,2/27,2/3,2/3,2/27,2",
+        "TalkerDecodeAttention/d=1,p=1/27,2/27,2/27,2/3,2/3,2/27,2",
+        "TalkerDecodeAttention/d=1,p=0/27,2/27,2/27,2/3,2/3,2/27,2"
+      ],
+      "staticKey": "c4c1cd713d5ecb4a0b5d9bbf831a80efbeae6024e686b80d093d7abb0a330e72,be1ae3149feeb841cd5bb266c545abdf8abe80059099de075630381cfb353ce8",
+      "inputs": [
+        {
+          "name": "query",
+          "index": 0,
+          "dtype": "bfloat16",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        },
+        {
+          "name": "key_cache",
+          "index": 1,
+          "dtype": "bfloat16",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        },
+        {
+          "name": "value_cache",
+          "index": 2,
+          "dtype": "bfloat16",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        },
+        {
+          "name": "block_table",
+          "index": 3,
+          "dtype": "int32",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        },
+        {
+          "name": "seq_lens",
+          "index": 4,
+          "dtype": "int32",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "attn_out",
+          "index": 0,
+          "dtype": "bfloat16",
+          "format": "ND",
+          "paramType": "required",
+          "shape": [
+            -2
+          ],
+          "format_match_mode": "FormatAgnostic"
+        }
+      ],
+      "attrs": [
+        {
+          "name": "num_heads",
+          "dtype": "int",
+          "value": 0
+        },
+        {
+          "name": "num_kv_heads",
+          "dtype": "int",
+          "value": 0
+        },
+        {
+          "name": "scale",
+          "dtype": "float",
+          "value": 0.0
+        }
+      ],
+      "opMode": "dynamic",
+      "optionalInputMode": "gen_placeholder",
+      "deterministic": "ignore",
+      "optionalOutputMode": "gen_placeholder",
+      "binInfo": {
+        "jsonFilePath": "ascend910_93/talker_decode_attention/TalkerDecodeAttention_71a2d38e67af078c45eb48f678b5872d.json"
+      }
+    }
+  ]
+}
