@@ -382,6 +382,9 @@ class AsyncOmniEngine:
     ) -> None:
         """Create loop, initialize stages, then run Orchestrator."""
 
+        from vllm_omni.utils.cpu_isolation import isolate_host_thread
+        isolate_host_thread(group=0)
+
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
 
