@@ -133,6 +133,27 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         super().load_model(*args, **kwargs)
         self._resolve_duplex_sampling_hook(force=True)
 
+    def propose_draft_token_ids(self, scheduler_output, sampled_token_ids, *args, **kwargs):
+        """Perf #25 (D7): fold the Thinker's terminator tail into the captured
+        verify shape instead of paying an eager 1-token step for it.
+
+        The n-gram drafter copies out of the prompt, which carries the chat
+        template's ``<|im_end|>`` but never ``<|tts_eos|>``, so the draft is
+        structurally wrong at the first terminator of every request. The
+        rewrite is exact under the rejection sampler (a draft token is only
+        emitted when it equals the model's argmax), so the emitted text cannot
+        change; ``VLLM_OMNI_MINICPMO_STAGE0_TAIL_DRAFT=off`` restores stock.
+        """
+        drafts = super().propose_draft_token_ids(scheduler_output, sampled_token_ids, *args, **kwargs)
+        if stage0_tail_draft.applies(self):
+            ids = sampled_token_ids if isinstance(sampled_token_ids, list) else []
+            drafts = stage0_tail_draft.rewrite(
+                drafts,
+                ids,
+                self.speculative_config.num_speculative_tokens,
+            )
+        return drafts
+
     def _update_states(self, scheduler_output: SchedulerOutput):
         deferred_state_corrections_fn = super()._update_states(scheduler_output)
         self._update_duplex_sampling_states(scheduler_output)
