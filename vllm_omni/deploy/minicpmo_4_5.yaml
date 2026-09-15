@@ -37,6 +37,9 @@ stages:
     # Leave headroom on the shared GPU for Talker KV + concurrent Code2Wav.
     gpu_memory_utilization: 0.55
     enforce_eager: false
+    # Perf #19: stage-level prefix caching override (the top level stays
+    # false for duplex safety; stage0 requests reuse their own prefixes).
+    enable_prefix_caching: true
     # Perf #14 (restored after the Daily-Omni yaml rewrite): ngram
     # speculative decoding on stage0; async scheduling is incompatible
     # with ngram under the current VllmConfig validation.
