@@ -767,35 +767,39 @@ def _apply_minicpmo_cudagraph_default(deploy: "DeployConfig") -> None:
     mode = os.environ.get(_MINICPMO_CUDAGRAPH_ENV, "FULL_DECODE_ONLY").strip()
     if not mode:
         return
-    for stage in deploy.stages:
-        if stage.stage_id not in _MINICPMO_GRAPH_STAGES:
-            continue
-        current = dict(stage.compilation_config or {})
-        if current.get("cudagraph_mode") == mode:
-            continue
-        if current.get("cudagraph_mode") is not None:
+    def _apply_one(cc: dict | None, label: str) -> dict:
+        current = dict(cc or {})
+        if current.get("cudagraph_mode") != mode and current.get("cudagraph_mode") is not None:
             logger.info(
-                "[minicpmo] stage %s cudagraph_mode %s -> %s (measured 25-33%% RTF on Ascend; "
+                "[minicpmo] %s cudagraph_mode %s -> %s (measured 25-33%% RTF on Ascend; "
                 "set %s to override)",
-                stage.stage_id,
+                label,
                 current.get("cudagraph_mode"),
                 mode,
                 _MINICPMO_CUDAGRAPH_ENV,
             )
         current["cudagraph_mode"] = mode
-        stage.compilation_config = current
+        return current
+
+    for stage in deploy.stages:
+        if stage.stage_id in _MINICPMO_GRAPH_STAGES:
+            stage.compilation_config = _apply_one(stage.compilation_config, f"stage {stage.stage_id}")
+    # Per-platform overlays are merged after this point, so patch them too.
+    platforms = getattr(deploy, "platforms", None)
+    if isinstance(platforms, dict):
+        for pname, pcfg in platforms.items():
+            if not isinstance(pcfg, dict):
+                continue
+            for entry in pcfg.get("stages") or []:
+                if isinstance(entry, dict) and entry.get("stage_id") in _MINICPMO_GRAPH_STAGES:
+                    entry["compilation_config"] = _apply_one(
+                        entry.get("compilation_config"), f"{pname} stage {entry.get('stage_id')}"
+                    )
 
 
-def _apply_minicpmo_perf_defaults(deploy: "DeployConfig") -> None:
-    """Apply MiniCPM-o perf code-defaults, scoped to this pipeline on NPU."""
-    model_type = None
-    for attr in ("pipeline", "pipeline_config"):
-        obj = getattr(deploy, attr, None)
-        if obj is not None:
-            model_type = getattr(obj, "model_type", None)
-            if model_type:
-                break
-    if model_type != "minicpmo_4_5":
+def _apply_minicpmo_perf_defaults(deploy: "DeployConfig", config_path: object = None) -> None:
+    """Apply MiniCPM-o perf code-defaults, scoped to this deploy config on NPU."""
+    if config_path is None or "minicpmo" not in str(config_path).lower():
         return
     try:
         from vllm_omni.platforms import current_omni_platform
@@ -846,7 +850,7 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
         if name in raw_dict:
             kwargs[name] = raw_dict[name]
     deploy = DeployConfig(**kwargs)
-    _apply_minicpmo_perf_defaults(deploy)
+    _apply_minicpmo_perf_defaults(deploy, path)
     return deploy
 
 
