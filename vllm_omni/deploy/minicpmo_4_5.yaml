@@ -37,6 +37,15 @@ stages:
     # Leave headroom on the shared GPU for Talker KV + concurrent Code2Wav.
     gpu_memory_utilization: 0.55
     enforce_eager: false
+    # Perf #14 (restored after the Daily-Omni yaml rewrite): ngram
+    # speculative decoding on stage0; async scheduling is incompatible
+    # with ngram under the current VllmConfig validation.
+    async_scheduling: false
+    speculative_config:
+      method: ngram
+      num_speculative_tokens: 15
+      prompt_lookup_min: 1
+      prompt_lookup_max: 1
     tensor_parallel_size: 1
     max_num_batched_tokens: 16384
     devices: "0"
@@ -95,7 +104,7 @@ stages:
   - stage_id: 2
     max_num_seqs: 4
     gpu_memory_utilization: 0.18
-    enforce_eager: true
+    enforce_eager: false
     enable_chunked_prefill: false
     max_num_batched_tokens: 65536
     max_model_len: 65536
