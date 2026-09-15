@@ -196,7 +196,8 @@ class OmniFixedKVAttentionBackendImpl(AscendAttentionBackendImpl):
         num_tokens,
         vllm_config,
         speculative_config=None,
-        num_dcp_pcp_tokens=None,
+        # T2/910B compat: num_dcp_pcp_tokens was dropped from the upstream
+        # signature (vllm-ascend removed PCP from MRV1, see #12592).
         draft_attn_metadatas=None,
     ):
         """Skip the per-step rebind for a step that captured no updatable tasks."""
@@ -215,7 +216,6 @@ class OmniFixedKVAttentionBackendImpl(AscendAttentionBackendImpl):
             num_tokens,
             vllm_config,
             speculative_config,
-            num_dcp_pcp_tokens,
             draft_attn_metadatas,
         )
 
