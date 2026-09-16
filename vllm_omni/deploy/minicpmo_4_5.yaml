@@ -17,11 +17,25 @@ connectors:
   connector_of_shared_memory:
     name: SharedMemoryConnector
     extra:
-      connector_get_sleep_s: 0.01
+      connector_get_sleep_s: 0.002
       connector_get_max_wait_first_chunk: 3000
       connector_get_max_wait: 300
-      codec_chunk_frames: 25
+      codec_chunk_frames: 75
       codec_left_context_frames: 3
+      # entry_21 C1: CFM solve steps (2 -> 3 knobs; stage-2 compute is
+      # paid 1:1 in RTF).
+      token2wav_n_timesteps: 3
+      # entry_21 C6: emit a five-frame preview first, then amortize
+      # Code2Wav fixed cost with large steady chunks (-9.1% RTF).
+      initial_codec_chunk_frames: 5
+      # entry_21 C4: keep recent reference WAVs + one read-only prompt
+      # setup state so per-request setup converges to ~0 ms.
+      token2wav_runtime_prompt_cache_size: 4
+      token2wav_setup_cache_size: 1
+      # entry_21 C2 (R4'): capture only the launch-bound first/last
+      # Token2Wav chunks; capture failures keep the eager path.
+      token2wav_r4p_npugraph: true
+      token2wav_r4p_max_graphs: 2
       # HiFT capture buckets are derived from codec_chunk_frames and
       # codec_left_context_frames. (#5869)
       # A future initial_codec_chunk_frames shape will use lazy capture unless
@@ -95,11 +109,12 @@ stages:
     # instead of the Sampler's whole-stream presence penalty.
     # min_tokens is upstream's min_new_token.
     default_sampling_params:
-      temperature: 0.8
-      top_p: 0.85
-      top_k: 25
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
       repetition_penalty: 1.05
       min_tokens: 50
+      stop_token_ids: [1]
       max_tokens: 4096
       seed: 42
       detokenize: false
@@ -134,6 +149,7 @@ platforms:
   npu:
     stages:
       - stage_id: 0
+        max_num_seqs: 8
         max_num_batched_tokens: 8192
         compilation_config:
           cudagraph_mode: PIECEWISE
@@ -143,9 +159,13 @@ platforms:
           # Perf #15: FULL_AND_PIECEWISE restores in-graph sampling and K-step
           # expansion (PIECEWISE silently disables them).
           cudagraph_mode: FULL_AND_PIECEWISE
-          cudagraph_capture_sizes: [1, 2, 4, 8, 16, 24, 32]
-          max_cudagraph_capture_size: 32
+        env:
+          # entry_21: prefer the packaged A14 boundary and its whole-step
+          # graph; fall back to the native sampler when the operator is absent.
+          VLLM_OMNI_A14_MODE: auto
+          VLLM_OMNI_A14_GRAPH: "1"
       - stage_id: 2
+        max_num_seqs: 8
         # Stage 2 stays outer-eager and captures only exact-shape CFM DiT
         # estimator kernels through the NPU platform patch.
         additional_config:
