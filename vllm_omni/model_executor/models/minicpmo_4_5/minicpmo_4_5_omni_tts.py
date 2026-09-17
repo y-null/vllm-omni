@@ -511,38 +511,36 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
     @classmethod
     def _soc_allows_k_step(cls) -> bool:
-        """False on SoCs whose rejection kernel cannot take spec-width rows.
+        """Ask the very question the deploy-config gate asked, and no other.
 
         910B family: rejection_random_sample_kernel hits a vector-core limit
         once the verifier runs K tokens per request, which crashed six bring-up
         attempts before this gate existed. 910C / A3 is the activation target.
 
-        The environment is consulted first ("ascend910b1" on 910B,
-        "ascend910_9391" on 910C) because the deploy-config gate that decides
-        whether to inject the speculative_config sees only the environment --
-        both sides have to agree on the same input. The device probe is a
-        fallback for a worker whose launch environment lacks the variables;
-        inside a worker the device is already initialised, so probing here
-        costs nothing. An unidentifiable SoC refuses: leaving the frame loop
-        off is a slower run, speccing a 910B faults the kernel.
+        This must delegate rather than re-probe. The config layer answers the
+        same question while building the deploy config (it decides whether to
+        inject the stage-1 speculative_config), and it can only see the launch
+        environment -- it deliberately never touches the device. A second,
+        device-probing answer here could differ from that one, and a mismatch
+        is not benign: if the loop arms while the scheduler has no
+        speculative_config it silently never engages, and if the scheduler
+        reserves K positions while the loop refuses them the stage deadlocks
+        with no request making progress. One source of truth, one answer.
         """
-        from vllm_omni.config.stage_config import _soc_name_from_env
+        from vllm_omni.config.stage_config import (
+            _MINICPMO_TALKER_FRAMES_ENV,
+            _npu_soc_allows_talker_multiframe,
+        )
 
-        name = _soc_name_from_env() or cls._probe_soc_name()
-        if name.lower().startswith("ascend910b"):
-            logger.warning(
-                "[minicpmo] SoC: %r is a 910B part -- K-step spec-width verify "
-                "is not supported there (rejection kernel limit).",
-                name,
+        if os.environ.get(_MINICPMO_TALKER_FRAMES_ENV, "").strip():
+            # An explicit frame count is an operator decision; the deploy-config
+            # gate arms on it too, so the two stay in agreement.
+            logger.info(
+                "[minicpmo] %s set explicitly; skipping the SoC check",
+                _MINICPMO_TALKER_FRAMES_ENV,
             )
-            return False
-        if not name:
-            logger.warning(
-                "[minicpmo] SoC not identified; leaving the K-step loop off.",
-            )
-            return False
-        logger.info("[minicpmo] SoC: %r", name)
-        return True
+            return True
+        return _npu_soc_allows_talker_multiframe()
 
     @classmethod
     def _parse_k_step_frames(cls) -> int:
