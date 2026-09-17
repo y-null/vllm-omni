@@ -18,6 +18,18 @@ Architecture:
 # throw in patch if the versions differ.
 from .version import __version__, __version_tuple__  # isort:skip # noqa: F401
 
+# Expose the packaged Ascend custom-OPP as early as possible. CANN reads
+# custom-OPP metadata only during process initialisation, so an activation
+# deferred to the first codec sample leaves the operator package unregistered
+# and the aclnn calls fail with ACL 161001. Auto mode stays silent on hosts
+# without the payload.
+try:
+    from ._a14_opp import activate_required_a14_opp as _activate_a14_opp
+except ImportError:  # pragma: no cover - lightweight installs
+    _activate_a14_opp = None
+if _activate_a14_opp is not None:
+    _activate_a14_opp()
+
 try:
     from . import patch  # noqa: F401
 except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency

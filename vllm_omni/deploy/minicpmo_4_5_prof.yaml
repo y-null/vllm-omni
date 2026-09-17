@@ -1,0 +1,204 @@
+# MiniCPM-o 4.5 three-stage deploy on one large-memory GPU.
+pipeline: minicpmo_4_5
+async_chunk: true
+# Native full-duplex shares this profile with /v1/chat/completions. Every other
+# duplex_session knob keeps its runtime default.
+session_mode: duplex
+# Keep the active window aligned with the session and stage capacities below.
+# A smaller window serializes first-packet generation for concurrent chat turns.
+duplex_session:
+  # Matches Stage 0/1 max_num_seqs below.
+  max_sessions: 4
+
+trust_remote_code: true
+enable_prefix_caching: false
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      connector_get_sleep_s: 0.002
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      codec_chunk_frames: 75
+      codec_left_context_frames: 3
+      # entry_21 C1: CFM solve steps (2 -> 3 knobs; stage-2 compute is
+      # paid 1:1 in RTF).
+      token2wav_n_timesteps: 3
+      # entry_21 C6: emit a five-frame preview first, then amortize
+      # Code2Wav fixed cost with large steady chunks (-9.1% RTF).
+      initial_codec_chunk_frames: 5
+      # entry_21 C4: keep recent reference WAVs + one read-only prompt
+      # setup state so per-request setup converges to ~0 ms.
+      token2wav_runtime_prompt_cache_size: 4
+      token2wav_setup_cache_size: 1
+      # entry_21 C2 (R4'): capture only the launch-bound first/last
+      # Token2Wav chunks; capture failures keep the eager path.
+      token2wav_r4p_npugraph: true
+      token2wav_r4p_max_graphs: 2
+      # HiFT capture buckets are derived from codec_chunk_frames and
+      # codec_left_context_frames. (#5869)
+      # A future initial_codec_chunk_frames shape will use lazy capture unless
+      # HiFTGraphWrapper.derive_capture_bucket_size explicitly includes it.
+      enable_hift_graph: true
+      enable_cfm_graph: true
+      cfm_max_graphs: 32
+      cfm_graph_bucket_frames: 16
+
+stages:
+  - stage_id: 0
+    profiler_config:
+      profiler: torch
+      torch_profiler_dir: /tmp/omni_prof
+      torch_profiler_with_stack: false
+      torch_profiler_record_shapes: true
+      torch_profiler_with_memory: false
+    max_num_seqs: 4
+    # Leave headroom on the shared GPU for Talker KV + concurrent Code2Wav.
+    gpu_memory_utilization: 0.55
+    enforce_eager: false
+    # Perf #19: stage-level prefix caching override (the top level stays
+    # false for duplex safety; stage0 requests reuse their own prefixes).
+    enable_prefix_caching: true
+    # Perf #14 (restored after the Daily-Omni yaml rewrite): ngram
+    # speculative decoding on stage0; async scheduling is incompatible
+    # with ngram under the current VllmConfig validation.
+    async_scheduling: false
+    speculative_config:
+      method: ngram
+      num_speculative_tokens: 14
+      prompt_lookup_min: 1
+      prompt_lookup_max: 1
+    tensor_parallel_size: 1
+    max_num_batched_tokens: 16384
+    devices: "0"
+    # Required for MiniCPM interleaved image/audio Daily-Omni packs (~78% recipe).
+    # Keep these in YAML so they are applied through --deploy-config.
+    interleave_mm_strings: true
+    media_io_kwargs:
+      video:
+        fps: 1
+        num_frames: 128
+    limit_mm_per_prompt:
+      # Daily-Omni MiniCPM pack: up to 64 interleaved image/audio pairs (1fps).
+      image: 64
+      audio: 64
+      video: 1
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 2048
+      seed: 42
+      detokenize: true
+      # 1.0 for MCQ accuracy; 1.1 can bias short A–D answers.
+      repetition_penalty: 1.0
+
+  - stage_id: 1
+    profiler_config:
+      profiler: torch
+      torch_profiler_dir: /tmp/omni_prof
+      torch_profiler_with_stack: false
+      torch_profiler_record_shapes: true
+      torch_profiler_with_memory: false
+    max_num_seqs: 4
+    # Preserve the checkpoint's full-attention Talker prompt while it fits;
+    # native duplex rolls over to a one-chunk window at context capacity.
+    # Leave device-level headroom for the colocated HiFi-GAN cuDNN workspace.
+    gpu_memory_utilization: 0.15
+    enforce_eager: false
+    max_num_batched_tokens: 8192
+    # Talker context is 4096 (tts_config.max_position_embeddings).
+    max_model_len: 4096
+    devices: "0"
+    output_connectors:
+      to_stage_2: connector_of_shared_memory
+    # Talker is a single-vocab codec LM. These knobs go to vLLM's Sampler
+    # (head_code logits). EOS is tts_config.eos_token_id (num_audio_tokens-1).
+    # Values track upstream utils.TTSSamplingParams (min_p/win_size/tau_r are
+    # declared there but never read, so they stay out). repetition_penalty is
+    # consumed by the Talker, which rescores it over upstream's 16-frame window
+    # instead of the Sampler's whole-stream presence penalty.
+    # min_tokens is upstream's min_new_token.
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      repetition_penalty: 1.05
+      min_tokens: 50
+      stop_token_ids: [1]
+      max_tokens: 4096
+      seed: 42
+      detokenize: false
+
+  - stage_id: 2
+    profiler_config:
+      profiler: torch
+      torch_profiler_dir: /tmp/omni_prof
+      torch_profiler_with_stack: false
+      torch_profiler_record_shapes: true
+      torch_profiler_with_memory: false
+    max_num_seqs: 4
+    gpu_memory_utilization: 0.18
+    enforce_eager: false
+    enable_chunked_prefill: false
+    max_num_batched_tokens: 65536
+    max_model_len: 65536
+    devices: "0"
+    input_connectors:
+      from_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      detokenize: true
+
+platforms:
+  cuda:
+    stages:
+      - stage_id: 1
+        # Full-attention occupancy is bounded by max_num_seqs * max_model_len
+        # (4 * 4096 = 16384 tokens). Keep the reported CUDA KV token capacity
+        # above that bound because physical-preemption replay is unsupported.
+        # The explicit cap leaves device headroom for concurrent Stage 2.
+        kv_cache_memory_bytes: 2147483648  # 2 GiB
+
+  npu:
+    stages:
+      - stage_id: 0
+        max_num_seqs: 8
+        max_num_batched_tokens: 8192
+        compilation_config:
+          cudagraph_mode: PIECEWISE
+      - stage_id: 1
+        max_num_batched_tokens: 8192
+        compilation_config:
+          # Perf #15: FULL_AND_PIECEWISE restores in-graph sampling and K-step
+          # expansion (PIECEWISE silently disables them).
+          cudagraph_mode: FULL_AND_PIECEWISE
+        env:
+          # entry_21: prefer the packaged A14 boundary and its whole-step
+          # graph; fall back to the native sampler when the operator is absent.
+          VLLM_OMNI_A14_MODE: auto
+          VLLM_OMNI_A14_GRAPH: "1"
+          # step-level profiling: without these the stage worker imports
+          # step_prof.py with _ENABLED=false and every tic/toc is a no-op.
+          OMNI_STEP_PROF: "0"
+          # Rebuilt TalkerDecodeAttention loads and runs standalone, but CANN
+          # refuses its binary inside the stage process (ACL 161001, SoC not
+          # configured). Keep the FIA path until that is resolved.
+          VLLM_OMNI_TALKER_DECODE_OP: "1"
+          # P93 fused adaLN measures as a regression on 910B3 (fused counters
+          # stayed 0 and 32/1 RTF went 0.461 -> 0.487), so it ships off
+          # here. entry_02 measured 8.45x on the block on 910C -- A/B it
+          # there with VLLM_OMNI_P93_FUSED_ADALN=1.
+          VLLM_OMNI_P93_FUSED_ADALN: "0"
+          OMNI_STEP_PROF_FLUSH: "200"
+      - stage_id: 2
+        max_num_seqs: 8
+        # Stage 2 stays outer-eager and captures only exact-shape CFM DiT
+        # estimator kernels through the NPU platform patch.
+        additional_config:
+          code2wav_enable_npu_graph: true
+          code2wav_max_npu_graphs: 32

@@ -69,8 +69,8 @@ def add_dtype_fmt_option_single(x, x_n, is_ref: bool = False):
 
 def get_dtype_fmt_options(__inputs__, __outputs__):
     options = []
-    input_names = ['raw_logits', 'history', 'history_len', 'step', 'min_tokens', 'temperature', 'repetition_penalty']
-    output_names = ['warped_logits']
+    input_names = ['query', 'key_cache', 'value_cache', 'block_table', 'seq_lens']
+    output_names = ['attn_out']
     unique_param_name_set = set()
     for idx, x in enumerate(__inputs__):
         if x is None:
@@ -139,9 +139,9 @@ def get_kernel_source(src_file, dir_snake, dir_ex):
         return src
     return src_ex
 
-def _build_args(raw_logits_in__, history_in__, history_len_in__, step_in__, min_tokens_in__, temperature_in__, repetition_penalty_in__, warped_logits_out_, vocab_size, eos_token_id, history_window, top_k, top_p, min_tokens_to_keep):
+def _build_args(query_in__, key_cache_in__, value_cache_in__, block_table_in__, seq_lens_in__, attn_out_out_, num_heads, num_kv_heads, scale):
     __inputs__ = []
-    for arg in [raw_logits_in__, history_in__, history_len_in__, step_in__, min_tokens_in__, temperature_in__, repetition_penalty_in__]:
+    for arg in [query_in__, key_cache_in__, value_cache_in__, block_table_in__, seq_lens_in__]:
         if arg != None:
             if isinstance(arg, (list, tuple)):
                 if len(arg) == 0:
@@ -152,7 +152,7 @@ def _build_args(raw_logits_in__, history_in__, history_len_in__, step_in__, min_
         else:
             __inputs__.append(arg)
     __outputs__ = []
-    for arg in [warped_logits_out_]:
+    for arg in [attn_out_out_]:
         if arg != None:
             if isinstance(arg, (list, tuple)):
                 if len(arg) == 0:
@@ -163,51 +163,33 @@ def _build_args(raw_logits_in__, history_in__, history_len_in__, step_in__, min_
         else:
             __outputs__.append(arg)
     __attrs__ = []
-    if vocab_size != None:
+    if num_heads != None:
         attr = {}
-        attr["name"] = "vocab_size"
+        attr["name"] = "num_heads"
         attr["dtype"] = "int"
-        attr["value"] = vocab_size
+        attr["value"] = num_heads
         __attrs__.append(attr)
-    if eos_token_id != None:
+    if num_kv_heads != None:
         attr = {}
-        attr["name"] = "eos_token_id"
+        attr["name"] = "num_kv_heads"
         attr["dtype"] = "int"
-        attr["value"] = eos_token_id
+        attr["value"] = num_kv_heads
         __attrs__.append(attr)
-    if history_window != None:
+    if scale != None:
         attr = {}
-        attr["name"] = "history_window"
-        attr["dtype"] = "int"
-        attr["value"] = history_window
-        __attrs__.append(attr)
-    if top_k != None:
-        attr = {}
-        attr["name"] = "top_k"
-        attr["dtype"] = "int"
-        attr["value"] = top_k
-        __attrs__.append(attr)
-    if top_p != None:
-        attr = {}
-        attr["name"] = "top_p"
+        attr["name"] = "scale"
         attr["dtype"] = "float"
-        attr["value"] = top_p
-        __attrs__.append(attr)
-    if min_tokens_to_keep != None:
-        attr = {}
-        attr["name"] = "min_tokens_to_keep"
-        attr["dtype"] = "int"
-        attr["value"] = min_tokens_to_keep
+        attr["value"] = scale
         __attrs__.append(attr)
     return __inputs__, __outputs__, __attrs__
 
-@tbe_register.register_operator("TalkerCodecLogitsPrepare", trans_bool_to_s8=False)
-@para_check.check_op_params(para_check.REQUIRED_INPUT, para_check.REQUIRED_INPUT, para_check.REQUIRED_INPUT, para_check.REQUIRED_INPUT, para_check.REQUIRED_INPUT, para_check.REQUIRED_INPUT, para_check.REQUIRED_INPUT, para_check.REQUIRED_OUTPUT, para_check.OPTION_ATTR_INT, para_check.OPTION_ATTR_INT, para_check.OPTION_ATTR_INT, para_check.OPTION_ATTR_INT, para_check.OPTION_ATTR_FLOAT, para_check.OPTION_ATTR_INT, para_check.KERNEL_NAME)
-def talker_codec_logits_prepare(raw_logits_in__, history_in__, history_len_in__, step_in__, min_tokens_in__, temperature_in__, repetition_penalty_in__, warped_logits_out_, vocab_size, eos_token_id, history_window, top_k, top_p, min_tokens_to_keep, kernel_name="talker_codec_logits_prepare", impl_mode = ""):
+@tbe_register.register_operator("TalkerDecodeAttention", trans_bool_to_s8=False)
+@para_check.check_op_params(para_check.REQUIRED_INPUT, para_check.REQUIRED_INPUT, para_check.REQUIRED_INPUT, para_check.REQUIRED_INPUT, para_check.REQUIRED_INPUT, para_check.REQUIRED_OUTPUT, para_check.OPTION_ATTR_INT, para_check.OPTION_ATTR_INT, para_check.OPTION_ATTR_FLOAT, para_check.KERNEL_NAME)
+def talker_decode_attention(query_in__, key_cache_in__, value_cache_in__, block_table_in__, seq_lens_in__, attn_out_out_, num_heads, num_kv_heads, scale, kernel_name="talker_decode_attention", impl_mode = ""):
     # do ascendc build step
     if get_current_build_config("enable_op_prebuild"):
         return
-    __inputs__, __outputs__, __attrs__ = _build_args(raw_logits_in__, history_in__, history_len_in__, step_in__, min_tokens_in__, temperature_in__, repetition_penalty_in__, warped_logits_out_, vocab_size, eos_token_id, history_window, top_k, top_p, min_tokens_to_keep)
+    __inputs__, __outputs__, __attrs__ = _build_args(query_in__, key_cache_in__, value_cache_in__, block_table_in__, seq_lens_in__, attn_out_out_, num_heads, num_kv_heads, scale)
     options = get_dtype_fmt_options(__inputs__, __outputs__)
     options += ["-x", "cce"]
 
@@ -261,34 +243,34 @@ def talker_codec_logits_prepare(raw_logits_in__, history_in__, history_len_in__,
         return re.sub(pattern, replace_match, input_str)
     options = [replace_env_vars(opt) for opt in options]
 
-    origin_func_name = "talker_codec_logits_prepare"
-    ascendc_src_dir_ex = "talker_codec_logits_prepare"
-    ascendc_src_dir = "talker_codec_logits_prepare"
+    origin_func_name = "talker_decode_attention"
+    ascendc_src_dir_ex = "talker_decode_attention"
+    ascendc_src_dir = "talker_decode_attention"
 
-    src_file_dict = {'ascend910b': './op_kernel//talker_codec_logits_prepare.cpp'}
+    src_file_dict = {}
     src_file = get_src_file_from_dict(src_file_dict, soc_short)
     if src_file != "":
         ascendc_src_file = src_file
     else:
-        ascendc_src_file = "talker_codec_logits_prepare.cpp"
+        ascendc_src_file = "talker_decode_attention.cpp"
     src = get_kernel_source(ascendc_src_file, ascendc_src_dir, ascendc_src_dir_ex)
 
-    msg = "start compile Ascend C Operator TalkerCodecLogitsPrepare, kernel name is " + kernel_name
+    msg = "start compile Ascend C Operator TalkerDecodeAttention, kernel name is " + kernel_name
     CommonUtility.print_compile_log("", msg, AscendCLogLevel.LOG_INFO)
-    op_type = "TalkerCodecLogitsPrepare"
+    op_type = "TalkerDecodeAttention"
     code_channel = get_code_channel(src, kernel_name, op_type, options)
     op_info = OpInfo(kernel_name = kernel_name, op_type = op_type, inputs = __inputs__, outputs = __outputs__,\
-        attrs = __attrs__ , impl_mode = impl_mode, origin_inputs=[raw_logits_in__, history_in__, history_len_in__, step_in__, min_tokens_in__, temperature_in__, repetition_penalty_in__], origin_outputs = [warped_logits_out_],\
-                param_type_dynamic = False, mc2_ctx = [], param_type_list = ['required', 'required', 'required', 'required', 'required', 'required', 'required', 'required'], init_value_list = [None],\
+        attrs = __attrs__ , impl_mode = impl_mode, origin_inputs=[query_in__, key_cache_in__, value_cache_in__, block_table_in__, seq_lens_in__], origin_outputs = [attn_out_out_],\
+                param_type_dynamic = False, mc2_ctx = [], param_type_list = ['required', 'required', 'required', 'required', 'required', 'required'], init_value_list = [None],\
                 output_shape_depend_on_compute = [])
     compile_op(src, origin_func_name, op_info, options, code_channel, '{}', {'valueDepend': {}})
 
-def op_select_format(raw_logits_in__, history_in__, history_len_in__, step_in__, min_tokens_in__, temperature_in__, repetition_penalty_in__, warped_logits_out_, vocab_size, eos_token_id, history_window, top_k, top_p, min_tokens_to_keep, impl_mode = ""):
-    __inputs__, __outputs__, __attrs__ = _build_args(raw_logits_in__, history_in__, history_len_in__, step_in__, min_tokens_in__, temperature_in__, repetition_penalty_in__, warped_logits_out_, vocab_size, eos_token_id, history_window, top_k, top_p, min_tokens_to_keep)
-    result = check_op_cap("op_select_format", "TalkerCodecLogitsPrepare", __inputs__, __outputs__, __attrs__)
+def op_select_format(query_in__, key_cache_in__, value_cache_in__, block_table_in__, seq_lens_in__, attn_out_out_, num_heads, num_kv_heads, scale, impl_mode = ""):
+    __inputs__, __outputs__, __attrs__ = _build_args(query_in__, key_cache_in__, value_cache_in__, block_table_in__, seq_lens_in__, attn_out_out_, num_heads, num_kv_heads, scale)
+    result = check_op_cap("op_select_format", "TalkerDecodeAttention", __inputs__, __outputs__, __attrs__)
     return result.decode("utf-8")
 
-def get_op_specific_info(raw_logits_in__, history_in__, history_len_in__, step_in__, min_tokens_in__, temperature_in__, repetition_penalty_in__, warped_logits_out_, vocab_size, eos_token_id, history_window, top_k, top_p, min_tokens_to_keep, impl_mode = ""):
-    __inputs__, __outputs__, __attrs__ = _build_args(raw_logits_in__, history_in__, history_len_in__, step_in__, min_tokens_in__, temperature_in__, repetition_penalty_in__, warped_logits_out_, vocab_size, eos_token_id, history_window, top_k, top_p, min_tokens_to_keep)
-    result = check_op_cap("get_op_specific_info", "TalkerCodecLogitsPrepare", __inputs__, __outputs__, __attrs__)
+def get_op_specific_info(query_in__, key_cache_in__, value_cache_in__, block_table_in__, seq_lens_in__, attn_out_out_, num_heads, num_kv_heads, scale, impl_mode = ""):
+    __inputs__, __outputs__, __attrs__ = _build_args(query_in__, key_cache_in__, value_cache_in__, block_table_in__, seq_lens_in__, attn_out_out_, num_heads, num_kv_heads, scale)
+    result = check_op_cap("get_op_specific_info", "TalkerDecodeAttention", __inputs__, __outputs__, __attrs__)
     return result.decode("utf-8")

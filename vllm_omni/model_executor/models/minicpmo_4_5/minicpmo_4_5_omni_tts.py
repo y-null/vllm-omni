@@ -13,7 +13,12 @@ Pipeline:
 """
 
 from collections.abc import Iterable, Mapping, Sequence
+import os
 from dataclasses import replace
+try:
+    import torch_npu  # noqa: F401  (NPU platform guarantee)
+except Exception:  # pragma: no cover
+    torch_npu = None
 from typing import Any
 
 import torch
@@ -31,6 +36,7 @@ from vllm_omni.engine.duplex.intermediate import get_tts_handoff
 from vllm_omni.model_executor.models.minicpmo_4_5 import MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.utils.step_prof import span as _prof_span
 
 logger = init_logger(__name__)
 
@@ -127,6 +133,170 @@ def _apply_batched_repetition_penalty(
         penalized[start:end] = torch.where(chunk_logits < 0, chunk_logits * alpha, chunk_logits / alpha)
 
     return penalized
+
+
+def _apply_top_k_top_p(
+    logits: torch.Tensor,
+    *,
+    top_k: int | None,
+    top_p: float | None,
+    min_tokens_to_keep: int = 3,
+    inplace: bool = False,
+) -> torch.Tensor:
+    """Reference warper: same candidate floors as the upstream warpers."""
+    filtered = logits if inplace else logits.clone()
+    vocab_size = filtered.shape[-1]
+    if top_p is not None and 0.0 < top_p < 1.0:
+        sorted_logits, sorted_indices = torch.sort(filtered, descending=False, dim=-1)
+        cumulative_probs = torch.softmax(sorted_logits, dim=-1).cumsum(dim=-1)
+        remove = cumulative_probs <= (1.0 - float(top_p))
+        remove[..., -min_tokens_to_keep:] = False
+        remove = remove.scatter(-1, sorted_indices, remove)
+        filtered.masked_fill_(remove, float("-inf"))
+    if top_k is not None and top_k > 0:
+        keep = min(vocab_size, max(int(top_k), min_tokens_to_keep))
+        threshold = torch.topk(filtered, keep, dim=-1).values[..., -1, None]
+        filtered.masked_fill_(filtered < threshold, float("-inf"))
+    return filtered
+
+
+_NPU_TOPK_CACHE: dict = {}
+_P156_FUSED = None
+if os.environ.get("MINICPMO_P156_FUSED_SAMPLER", "0") == "1":
+    try:
+        from vllm_omni.platforms.npu.ops_opt import p156_fused_sampler as _P156_FUSED  # noqa: F811
+    except Exception:
+        _P156_FUSED = None
+
+# p130 online feasibility probe (observe-only): scores the ngram draft
+# proposer's top-1/2/4 recall on the live codec stream to decide whether
+# spec-decode integration is worth building. Never changes a sampled id.
+_P130_MOD = None
+if os.environ.get("MINICPMO_P130_PROBE", "0") == "1":
+    try:
+        from vllm_omni.platforms.npu.ops_opt import p130_spec_draft as _P130_MOD
+    except Exception:
+        _P130_MOD = None
+_P130_PROBE: dict = {"buf": {}, "hits": {k: [0, 0] for k in (1, 2, 4)}, "batches": 0, "seen": 0}
+
+
+def _p130_probe_observe(request_id, window_dev):
+    if _P130_MOD is None:
+        return
+    try:
+        probe = _P130_PROBE
+        buf = probe["buf"].setdefault(request_id, [])
+        buf.append(window_dev)
+        if sum(b.numel() for b in buf) < 256:
+            return
+        data = torch.cat(buf).tolist()
+        probe["buf"][request_id] = []
+        p = probe["proposer"]
+        if p is None or len(data) < 40:
+            return
+        if probe["seen"] > 12000:  # keep the ngram table windowed
+            probe["proposer"] = p = _P130_MOD.DraftProposer()
+            probe["seen"] = 0
+        hist, fresh = data[:-16], data[-16:]
+        p.observe(hist)
+        for i, tok in enumerate(fresh):
+            ctx = (hist + fresh[:i])[-32:]
+            if len(ctx) >= 4:
+                for k in (1, 2, 4):
+                    prop = p.propose(ctx, k)
+                    h = probe["hits"][k]
+                    h[0] += int(bool(prop) and prop[0] == tok)
+                    h[1] += 1
+            p.observe([tok])
+        probe["seen"] += len(data)
+        probe["batches"] += 1
+        if probe["batches"] % 20 == 0:
+            h = probe["hits"]
+            logger.info(
+                "[minicpmo] p130 ngram probe: top-1=%.3f top-2=%.3f top-4=%.3f (n=%d)",
+                h[1][0] / max(1, h[1][1]), h[2][0] / max(1, h[2][1]),
+                h[4][0] / max(1, h[4][1]), h[1][1],
+            )
+    except Exception:
+        pass
+_NPU_TOP_K_TOP_P = os.environ.get("MINICPMO_TTS_NPU_TOPK_TOPP", "1") != "0"
+# npu_top_k_top_p wins on launches at small batch but loses to the two-op
+# torch path at large batch (128/8 A/B: 1.391 gated-off vs on).
+_NPU_TOPK_MAX_BATCH = int(os.environ.get("MINICPMO_TTS_NPU_TOPK_TOPP_MAX_BATCH", "64"))
+
+
+def _npu_top_k_top_p_warp(logits, *, top_k, top_p):
+    """Fused top-k/top-p floor via torch_npu.npu_top_k_top_p.
+
+    Kernel semantics: keep top-k by value, then keep the top-p probability
+    mass over the retained set. Falls back to the exact PyTorch warper when
+    the kernel is unavailable or fails.
+    """
+    if top_k is None or top_p is None or not 0.0 < top_p < 1.0:
+        return logits
+    npu = getattr(torch_npu, "npu_top_k_top_p", None)
+    if npu is None:
+        return logits
+    key = (str(logits.device), str(logits.dtype), float(top_p), int(top_k))
+    cached = _NPU_TOPK_CACHE.get(key)
+    if cached is None:
+        dev = torch.full((1,), float(top_p), device=logits.device, dtype=logits.dtype)
+        dk = torch.full((1,), int(top_k), device=logits.device, dtype=torch.int32)
+        _NPU_TOPK_CACHE[key] = (dev, dk)
+    else:
+        dev, dk = cached
+    try:
+        return npu(
+            logits,
+            dev.expand(logits.shape[0]).contiguous(),
+            dk.expand(logits.shape[0]).contiguous(),
+        )
+    except Exception:
+        return _apply_top_k_top_p(logits, top_k=top_k, top_p=top_p, min_tokens_to_keep=3, inplace=True)
+
+
+def _maybe_prewarp_top_k_top_p(logits, sampling_metadata):
+    """Pre-apply the fused floor and neutralize the sampler's own warpers.
+
+    Only engages when every row shares one (top_k, top_p) at temperature 1.0,
+    where the floor on raw logits is exactly the floor the sampler would
+    compute itself (top-k is rank based, so temperature invariance holds and
+    top-p mass matches at T=1). Any structural surprise returns None and the
+    native sampler path runs untouched.
+    """
+    if not _NPU_TOP_K_TOP_P:
+        return None
+    if not isinstance(logits, torch.Tensor) or logits.ndim != 2 or logits.shape[0] == 0:
+        return None
+    if logits.shape[0] > _NPU_TOPK_MAX_BATCH:
+        return None
+    if getattr(torch_npu, "npu_top_k_top_p", None) is None:
+        return None
+    try:
+        params = getattr(sampling_metadata, "sampling_params", None)
+        if not isinstance(params, (list, tuple)) or len(params) != logits.shape[0]:
+            return None
+        top_k = top_p = None
+        for sp in params:
+            k = getattr(sp, "top_k", None)
+            pp = getattr(sp, "top_p", None)
+            t = getattr(sp, "temperature", None)
+            if t is None or float(t) != 1.0:
+                return None
+            if k is None or int(k) <= 0:
+                return None
+            if pp is None or not 0.0 < float(pp) < 1.0:
+                return None
+            if top_k is None:
+                top_k, top_p = int(k), float(pp)
+            elif int(k) != top_k or float(pp) != top_p:
+                return None
+        logits = _npu_top_k_top_p_warp(logits, top_k=top_k, top_p=top_p)
+        new_params = [replace(sp, top_p=1.0, top_k=-1) for sp in params]
+        sampling_metadata = replace(sampling_metadata, sampling_params=list(new_params))
+        return logits, sampling_metadata
+    except Exception:
+        return None
 
 
 class _MiniCPMTTSProjector(nn.Module):
@@ -503,6 +673,32 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             }
             if retained_codes:
                 state["recent_codes"] = retained_codes
+                # Rebuild the device-side penalty window once per chunk from the
+                # carried-over ids; the per-frame path below then appends on
+                # device without touching the host again.
+                retained = [int(code_id) for code_id in retained_codes][-_CODEC_PENALTY_WINDOW:]
+                if retained:
+                    penalty_windows = getattr(self, "_penalty_windows_dev", None)
+                    if not isinstance(penalty_windows, dict):
+                        penalty_windows = {}
+                        self._penalty_windows_dev = penalty_windows
+                    penalty_windows[request_id] = torch.tensor(retained, dtype=torch.long, device=embeds.device)
+                    pf_freq = torch.zeros(
+                        int(getattr(self, "_num_audio_tokens", 0) or 0),
+                        device=embeds.device,
+                        dtype=torch.float32,
+                    )
+                    if pf_freq.numel() > 0:
+                        pf_freq.index_add_(
+                            0,
+                            penalty_windows[request_id],
+                            torch.ones(len(retained), device=embeds.device, dtype=torch.float32),
+                        )
+                        pf_dict = getattr(self, "_penalty_freqs_dev", None)
+                        if not isinstance(pf_dict, dict):
+                            pf_dict = {}
+                            self._penalty_freqs_dev = pf_dict
+                        pf_dict[request_id] = pf_freq
             request_states = getattr(self, "_request_audio_states", None)
             if request_states is None:
                 request_states = {}
@@ -573,6 +769,17 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         mask_eos_rows = [False] * len(infos)
         empty_history = hidden.new_empty((0,), dtype=torch.long)
         penalty_histories = [empty_history for _ in infos]
+        # Per-request penalty windows stay on the NPU and live outside the
+        # serialized audio_state, so no hop pays a D2H/H2D for them.
+        penalty_windows = getattr(self, "_penalty_windows_dev", None)
+        if not isinstance(penalty_windows, dict):
+            penalty_windows = {}
+            self._penalty_windows_dev = penalty_windows
+        penalty_freqs = getattr(self, "_penalty_freqs_dev", None)
+        if not isinstance(penalty_freqs, dict):
+            penalty_freqs = {}
+            self._penalty_freqs_dev = penalty_freqs
+        penalty_freq_rows: list = [None for _ in infos]
         for index, info in enumerate(infos):
             info_dict = info if isinstance(info, dict) else {}
             native_duplex = info_dict.get("native_duplex") is True
@@ -632,12 +839,53 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 state["step"] = int(state.get("step", 0)) + 1
                 # ``audio`` is the id sampled last step, i.e. exactly upstream's
                 # ``new_tokens[:, 0:t]`` history for the logits computed below.
-                recent = state.get("recent_codes")
-                recent = (recent if isinstance(recent, list) else []) + codec_deltas[index].reshape(-1).tolist()
-                state["recent_codes"] = recent[-_CODEC_PENALTY_WINDOW:]
-            recent_codes = state.get("recent_codes")
-            if recent_codes:
-                penalty_histories[index] = torch.tensor(recent_codes, dtype=torch.long, device=hidden.device)
+                # Keep that history as a device-side sliding window: the penalty
+                # consumes it on the NPU and the old host-list round trip cost a
+                # blocking D2H plus an H2D every frame.
+                prev_window = penalty_windows.get(request_id)
+                new_code = codec_deltas[index].reshape(-1)
+                if isinstance(prev_window, torch.Tensor) and prev_window.device == hidden.device:
+                    window = torch.cat([prev_window[-(_CODEC_PENALTY_WINDOW - 1) :], new_code])
+                else:
+                    window = new_code.clone()
+                penalty_windows[request_id] = window[-_CODEC_PENALTY_WINDOW:]
+                if _P130_MOD is not None:
+                    _p130_probe_observe(request_id, window[-_CODEC_PENALTY_WINDOW:])
+                # Incremental repetition histogram: evict exactly the oldest
+                # window token and count the fresh one (+1/-1 index_add_), so
+                # sample() never rebuilds a vocab-wide bincount per step.
+                vocab = int(getattr(self, "_num_audio_tokens", 0) or 0)
+                freqs = penalty_freqs.get(request_id)
+                if vocab > 0 and (
+                    not isinstance(freqs, torch.Tensor)
+                    or freqs.device != hidden.device
+                    or freqs.numel() != vocab
+                ):
+                    freqs = torch.zeros(vocab, device=hidden.device, dtype=torch.float32)
+                    freqs.index_add_(
+                        0,
+                        window.reshape(-1).to(dtype=torch.long),
+                        torch.ones(window.numel(), device=hidden.device, dtype=torch.float32),
+                    )
+                elif vocab > 0:
+                    if (
+                        isinstance(prev_window, torch.Tensor)
+                        and prev_window.numel() == _CODEC_PENALTY_WINDOW
+                    ):
+                        freqs.index_add_(0, prev_window[:1], freqs.new_full((1,), -1.0))
+                    freqs.index_add_(0, new_code, freqs.new_ones(new_code.shape[0]))
+                if vocab > 0:
+                    penalty_freqs[request_id] = freqs
+                # The host list only feeds the duplex conditioning handoff, so
+                # the offline path skips the .tolist() sync entirely.
+                if native_duplex:
+                    recent = state.get("recent_codes")
+                    recent = (recent if isinstance(recent, list) else []) + codec_deltas[index].reshape(-1).tolist()
+                    state["recent_codes"] = recent[-_CODEC_PENALTY_WINDOW:]
+            penalty_window = penalty_windows.get(request_id)
+            if isinstance(penalty_window, torch.Tensor) and penalty_window.numel() > 0:
+                penalty_histories[index] = penalty_window
+            penalty_freq_rows[index] = penalty_freqs.get(request_id)
             max_tokens = state.get("max_tokens")
             min_tokens = state.get("min_tokens")
             step = int(state.get("step", 0))
@@ -663,6 +911,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self._force_eos_rows = force_eos_rows
         self._mask_eos_rows = mask_eos_rows
         self._penalty_histories = penalty_histories
+        self._penalty_freq_rows = penalty_freq_rows
         meta_outputs = {"finished": terminal_flags}
         if emit_duplex_metadata:
             meta_outputs.update(
@@ -688,9 +937,15 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
     def _flush_deferred_cleanup(self) -> None:
         request_audio_states = getattr(self, "_request_audio_states", {})
         request_condition_states = getattr(self, "_request_condition_states", {})
+        penalty_windows = getattr(self, "_penalty_windows_dev", None)
+        penalty_freqs = getattr(self, "_penalty_freqs_dev", None)
         for request_id in self._deferred_cleanup_ids:
             request_audio_states.pop(request_id, None)
             request_condition_states.pop(request_id, None)
+            if isinstance(penalty_windows, dict):
+                penalty_windows.pop(request_id, None)
+            if isinstance(penalty_freqs, dict):
+                penalty_freqs.pop(request_id, None)
         self._deferred_cleanup_ids.clear()
 
     def _dummy_hidden_states(
@@ -775,10 +1030,15 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 sampling_metadata,
                 prompt_token_ids=blank_scheduler_prompt_for_penalties(prompt_ids, logits.shape[-1]),
             )
-        logits, sampling_metadata = self._apply_codec_repetition_penalty(logits, sampling_metadata)
+        with _prof_span("tts_penalty"):
+            logits, sampling_metadata = self._apply_codec_repetition_penalty(logits, sampling_metadata)
         force_eos = self._pending_force_eos_rows
         self._pending_force_eos_rows = None
-        output = Sampler()(logits, sampling_metadata)
+        prewarped = _maybe_prewarp_top_k_top_p(logits, sampling_metadata)
+        if prewarped is not None:
+            logits, sampling_metadata = prewarped
+        with _prof_span("tts_sampler"):
+            output = Sampler()(logits, sampling_metadata)
         return self._force_eos_on_sampled_ids(output, force_eos)
 
     def _apply_codec_repetition_penalty(self, logits, sampling_metadata):
@@ -806,7 +1066,25 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             or not isinstance(penalties, torch.Tensor)
             or getattr(sampling_metadata, "no_penalties", False)
         ):
+            self._penalty_freq_rows = None
             return logits, sampling_metadata
+        freq_rows = getattr(self, "_penalty_freq_rows", None)
+        self._penalty_freq_rows = None
+        if (
+            isinstance(freq_rows, list)
+            and len(freq_rows) == logits.shape[0]
+            and all(isinstance(f, torch.Tensor) and f.device == logits.device and f.numel() == logits.shape[-1] for f in freq_rows)
+            and bool((penalties.reshape(-1) != 1.0).any())
+        ):
+            # Incremental histogram: freq rows are maintained on device by
+            # make_omni_output (+1 append / -1 evict), identical to a full
+            # scatter_add rebuild of the sliding window.
+            freqs = torch.stack([f.to(dtype=torch.float32) for f in freq_rows], dim=0)
+            alpha = torch.pow(
+                penalties.to(device=logits.device, dtype=torch.float32).reshape(-1, 1), freqs
+            ).to(dtype=logits.dtype)
+            logits = torch.where(logits < 0, logits * alpha, logits / alpha)
+            return logits, replace(sampling_metadata, repetition_penalties=torch.ones_like(penalties))
         logits = _apply_batched_repetition_penalty(
             logits,
             histories,

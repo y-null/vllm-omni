@@ -1,4 +1,5 @@
 #include "kernel_operator.h"
+#include "talker_codec_logits_prepare_tiling.h"
 
 using namespace AscendC;
 
@@ -238,6 +239,7 @@ extern "C" __global__ __aicore__ void talker_codec_logits_prepare(
     GM_ADDR min_tokens, GM_ADDR temperature, GM_ADDR repetition_penalty,
     GM_ADDR warped_logits, GM_ADDR workspace, GM_ADDR tiling)
 {
+    REGISTER_TILING_DEFAULT(TalkerCodecLogitsPrepareTilingData);
     GET_TILING_DATA(tilingData, tiling);
     (void)workspace;
     KernelTalkerCodecLogitsPrepare kernel;

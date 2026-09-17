@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import functools
+import os
 import re
 import warnings
 from collections.abc import Callable, Mapping
