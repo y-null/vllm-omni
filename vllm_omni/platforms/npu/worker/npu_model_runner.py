@@ -442,6 +442,56 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
             self._finalize_dump_data(dump=False)
             return hidden_states, hidden_states
 
+    def propose_draft_token_ids(self, sampled_token_ids, *args, **kwargs):
+        """Draft tokens for the K-step Talker and for the Thinker's tail.
+
+        Lives on the shared base because the two concrete runners differ by
+        stage: stage 0 (the Thinker) is served by NPUARModelRunner, while
+        stage 1 -- the Talker, and therefore the K-step loop -- is served by
+        NPUGenerationModelRunner. An override on the AR subclass alone never
+        runs for the Talker, which leaves the model's own n-gram proposer
+        drafting single tokens while the deploy config still asks the
+        scheduler for K positions: every step then schedules one token,
+        ``talker_multiframe.applies`` sees span 1 and declines, and the
+        mult-frame loop silently never engages.
+
+        Stage 1 (K-step): the Talker's "drafts" are the constant ``continue``
+        id -- the multi-frame loop generates the K frames through those
+        speculative slots, so nothing is copied from the prompt.
+
+        Stage 0: fold the Thinker's terminator tail into the captured verify
+        shape instead of paying an eager 1-token step for it. The n-gram
+        drafter copies out of the prompt, which carries the chat template's
+        ``<|im_end|>`` but never ``<|tts_eos|>``, so the draft is structurally
+        wrong at the first terminator of every request. The rewrite is exact
+        under the rejection sampler (a draft token is only emitted when it
+        equals the model's argmax), so the emitted text cannot change;
+        ``VLLM_OMNI_MINICPMO_STAGE0_TAIL_DRAFT=off`` restores the stock
+        behaviour.
+
+        NOTE: the NPU draft call site passes ``sampled_token_ids`` first
+        (vllm-ascend ``NPUModelRunner.propose_draft_token_ids``); the upstream
+        GPU signature has ``scheduler_output`` first instead.
+        """
+        frames = int(getattr(getattr(self, "model", None), "_k_step_frames", 0) or 0)
+        if frames > 1:
+            from vllm_omni.platforms.npu.worker import talker_multiframe
+
+            ids = sampled_token_ids if isinstance(sampled_token_ids, list) else []
+            num_reqs = len(ids) or int(getattr(getattr(self, "input_batch", None), "num_reqs", 0) or 0)
+            return talker_multiframe.constant_drafts(ids, frames, num_reqs)
+        drafts = super().propose_draft_token_ids(sampled_token_ids, *args, **kwargs)
+        from vllm_omni.platforms.npu.worker import stage0_tail_draft
+
+        if stage0_tail_draft.applies(self):
+            ids = sampled_token_ids if isinstance(sampled_token_ids, list) else []
+            drafts = stage0_tail_draft.rewrite(
+                drafts,
+                ids,
+                self.speculative_config.num_speculative_tokens,
+            )
+        return drafts
+
     def _model_forward(
         self,
         num_tokens_padded: int,
