@@ -32,7 +32,7 @@ A replay of the 20-layer forward is 0.83 ms of device and 8 us of host
 and the ~2.9 ms is paid once. At K=4 that is a cadence of ~1.9 ms against ~4.0.
 
 Nothing in the loop touches the host: the embedding lookup, the codec sample
-(the A14 captured step), the stop row and the emitted delta are all device
+(the captured codec-sampling step), the stop row and the emitted delta are all device
 tensors enqueued in order on one stream, and the runner's existing coalesced
 D2H carries them out at the end of the step.
 

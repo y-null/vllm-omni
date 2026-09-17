@@ -381,8 +381,8 @@ class AsyncOmniEngine:
         )
 
         logger.info(f"[AsyncOmniEngine] Orchestrator ready with {self.num_stages} stages")
-        # Perf #16 (entry_18 W4): one-shot full-chain prewarm in a background
-        # thread, so the first request does not pay lazy graph captures.
+        # One-shot full-chain prewarm in a background thread, so the first
+        # request does not pay lazy graph captures.
         if os.environ.get("W4_PREWARM", "1") == "1" and not getattr(self, "_w4_prewarm_fired", False):
             self._w4_prewarm_fired = True
             port = int(os.environ.get("W4_PREWARM_PORT", "47053"))

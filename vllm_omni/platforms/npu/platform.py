@@ -56,7 +56,7 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
 
     @classmethod
     def get_attn_backend_cls(cls, selected_backend, attn_selector_config, num_heads: int | None = None):
-        """Route short-context decoders onto the fixed-KV decode backend (perf T2).
+        """Route short-context decoders onto the fixed-KV decode backend.
 
         Under FULL_DECODE_ONLY the captured decode step has to re-issue attention on
         every layer on every step, because the op takes the KV length as a host

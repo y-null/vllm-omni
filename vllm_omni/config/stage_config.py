@@ -756,11 +756,12 @@ _MINICPMO_CUDAGRAPH_ENV = "VLLM_OMNI_MINICPMO_CUDAGRAPH_MODE"
 def _apply_minicpmo_cudagraph_default(deploy: "DeployConfig") -> None:
     """Force FULL_DECODE_ONLY for MiniCPM-o decode stages on Ascend.
 
-    Perf T1 (entry_21): the shipped minicpmo_4_5.yaml pins PIECEWISE for stages
-    0 and 1, and under FULL_DECODE_ONLY the captured decode step stops
-    re-issuing attention per layer per step. Measured output-neutral:
-        A2/910B3, cards swapped   0.3737 (FULL) / 0.5543 (PIECEWISE)
-        A3/910C, dies swapped     0.2553 / 0.2410 (FULL) vs 0.3198 / 0.3216
+    The shipped minicpmo_4_5.yaml pins PIECEWISE for stages 0 and 1. Under
+    FULL_DECODE_ONLY the captured decode step stops re-issuing attention per
+    layer per step, which is where the RTF win comes from. Measured
+    output-neutral on both parts, dies/cards swapped:
+        910B3   0.3737 (FULL) vs 0.5543 (PIECEWISE)
+        910C    0.2553 / 0.2410 (FULL) vs 0.3198 / 0.3216
     Set VLLM_OMNI_MINICPMO_CUDAGRAPH_MODE to another mode to restore config.
     """
     import os
@@ -800,8 +801,8 @@ def _apply_minicpmo_cudagraph_default(deploy: "DeployConfig") -> None:
 
 _MINICPMO_TALKER_FRAMES_ENV = "VLLM_OMNI_MINICPMO_TALKER_FRAMES"
 # K = codec frames one stage-1 execute_model produces. 8 is the conservative
-# starting point on 910C/A3 (entry_21 measures 16 a further -6.9% at a higher
-# TTFP cost, so the ceiling is left reachable through the environment).
+# starting point on 910C/A3; K=16 measures a further -6.9% at a higher TTFP
+# cost, so the ceiling stays reachable through the environment.
 _MINICPMO_TALKER_FRAMES = 8
 # Same TND ceiling as stage 0: at most 16 query positions per sequence.
 _MINICPMO_TALKER_FRAMES_MAX = 16
@@ -862,8 +863,8 @@ def _apply_minicpmo_talker_multiframe_default(deploy: "DeployConfig") -> None:
 
     A stage-1 decode step is dominated by per-*step* host work rather than per
     frame, so running K frames inside one `execute_model` pays that host cost
-    once (entry_21: ~2.9 ms of host around a 0.83 ms device forward, over ~118
-    frames per request). The frames are *sequential* -- frame k+1 is
+    once (measured on 910C/A3: ~2.9 ms of host around a 0.83 ms device forward,
+    over ~118 frames per request). The frames are *sequential* -- frame k+1 is
     conditioned on the codec token sampled at frame k -- so this is not
     speculative decoding and the runner runs its own inner loop. vLLM still
     has to know the request advanced by K tokens, because that is what grows

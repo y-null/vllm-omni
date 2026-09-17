@@ -1168,8 +1168,8 @@ _LLM_STAGE_ENGINE_FIELDS = (
     | _LLM_SCHEDULER_ENGINE_FIELDS
     | _LLM_PARALLEL_CONFIG_ENGINE_FIELDS
     | {"parallel_config"}
-    # Perf #14: speculative_config is a standard VllmConfig field (owned by
-    # upstream SpeculativeConfig); allow it as a per-stage engine override.
+    # speculative_config is a standard VllmConfig field (owned by upstream
+    # SpeculativeConfig); allow it as a per-stage engine override.
     | {"speculative_config"}
 )
 _DIFFUSION_OWNED_STAGE_ENGINE_FIELDS = (

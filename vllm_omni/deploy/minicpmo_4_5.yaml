@@ -22,18 +22,15 @@ connectors:
       connector_get_max_wait: 300
       codec_chunk_frames: 75
       codec_left_context_frames: 3
-      # entry_21 C1: CFM solve steps (2 -> 3 knobs; stage-2 compute is
-      # paid 1:1 in RTF).
-      token2wav_n_timesteps: 3
-      # entry_21 C6: emit a five-frame preview first, then amortize
-      # Code2Wav fixed cost with large steady chunks (-9.1% RTF).
+      # Emit a five-frame preview first, then amortize Code2Wav's fixed
+      # per-chunk cost with large steady chunks (-9.1% RTF).
       initial_codec_chunk_frames: 5
-      # entry_21 C4: keep recent reference WAVs + one read-only prompt
-      # setup state so per-request setup converges to ~0 ms.
+      # Keep a few recent reference WAVs plus one read-only prompt-setup
+      # state so per-request setup converges to ~0 ms.
       token2wav_runtime_prompt_cache_size: 4
       token2wav_setup_cache_size: 1
-      # entry_21 C2 (R4'): capture only the launch-bound first/last
-      # Token2Wav chunks; capture failures keep the eager path.
+      # Capture only the launch-bound first/last Token2Wav chunks into
+      # NPU graphs; capture failures keep the eager path.
       token2wav_r4p_npugraph: true
       token2wav_r4p_max_graphs: 2
       # HiFT capture buckets are derived from codec_chunk_frames and
@@ -51,12 +48,11 @@ stages:
     # Leave headroom on the shared GPU for Talker KV + concurrent Code2Wav.
     gpu_memory_utilization: 0.55
     enforce_eager: false
-    # Perf #19: stage-level prefix caching override (the top level stays
-    # false for duplex safety; stage0 requests reuse their own prefixes).
+    # Stage-level prefix caching override (the top level stays false for
+    # duplex safety; stage0 requests reuse their own prefixes).
     enable_prefix_caching: true
-    # Perf #14 (restored after the Daily-Omni yaml rewrite): ngram
-    # speculative decoding on stage0; async scheduling is incompatible
-    # with ngram under the current VllmConfig validation.
+    # N-gram speculative decoding on stage0. async_scheduling must stay false
+    # next to it: vLLM's VllmConfig validation rejects the combination.
     async_scheduling: false
     speculative_config:
       method: ngram
@@ -156,12 +152,13 @@ platforms:
       - stage_id: 1
         max_num_batched_tokens: 8192
         compilation_config:
-          # Perf #15: FULL_AND_PIECEWISE restores in-graph sampling and K-step
+          # FULL_AND_PIECEWISE restores in-graph sampling and K-step
           # expansion (PIECEWISE silently disables them).
           cudagraph_mode: FULL_AND_PIECEWISE
         env:
-          # entry_21: prefer the packaged A14 boundary and its whole-step
-          # graph; fall back to the native sampler when the operator is absent.
+          # A14 is the packaged fused codec-boundary operator. Prefer it and
+          # its whole-step graph; fall back to the native sampler when the
+          # operator payload is absent.
           VLLM_OMNI_A14_MODE: auto
           VLLM_OMNI_A14_GRAPH: "1"
       - stage_id: 2

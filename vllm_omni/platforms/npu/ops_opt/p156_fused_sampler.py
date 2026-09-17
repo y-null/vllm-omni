@@ -1,4 +1,4 @@
-"""P156: 融合采样器驱动（top-k/top-p 融合 floor + 噪声 argmax 采样尾）。
+"""融合采样器驱动（top-k/top-p 融合 floor + 噪声 argmax 采样尾）。
 
 机理：温度/重复惩罚之后的采样尾收拢为一个融合核调用
 （torch_npu.npu_top_k_top_p），候选 floor 用设备常量缓存避免每次 H2D；

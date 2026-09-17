@@ -201,7 +201,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             return super()._check_and_update_cudagraph_mode(*args, **kwargs)
 
     def _capture_cudagraphs(self, *args, **kwargs):
-        """Capture fixed-KV decode graphs per KV capacity bucket (perf T2).
+        """Capture fixed-KV decode graphs per KV capacity bucket.
 
         Each bucket needs its own pass: the default path leaves the capacity unset
         and would file the graphs under a key decode never looks up. Signature is
@@ -409,9 +409,26 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         return merged
 
     def propose_draft_token_ids(self, sampled_token_ids, *args, **kwargs):
-        # K-step: the Talker's "drafts" are the constant continue id -- the
-        # loop generates the K frames through the speculative slots; nothing
-        # is copied from the prompt.
+        """Draft tokens for the K-step Talker and for the Thinker's tail.
+
+        Stage 1 (K-step): the Talker's "drafts" are the constant ``continue``
+        id -- the multi-frame loop generates the K frames through those
+        speculative slots, so nothing is copied from the prompt.
+
+        Stage 0: fold the Thinker's terminator tail into the captured verify
+        shape instead of paying an eager 1-token step for it. The n-gram
+        drafter copies out of the prompt, which carries the chat template's
+        ``<|im_end|>`` but never ``<|tts_eos|>``, so the draft is structurally
+        wrong at the first terminator of every request. The rewrite is exact
+        under the rejection sampler (a draft token is only emitted when it
+        equals the model's argmax), so the emitted text cannot change;
+        ``VLLM_OMNI_MINICPMO_STAGE0_TAIL_DRAFT=off`` restores the stock
+        behaviour.
+
+        NOTE: the NPU draft call site passes ``sampled_token_ids`` first
+        (vllm-ascend ``NPUModelRunner.propose_draft_token_ids``); the upstream
+        GPU signature has ``scheduler_output`` first instead.
+        """
         frames = int(getattr(getattr(self, "model", None), "_k_step_frames", 0) or 0)
         if frames > 1:
             from vllm_omni.platforms.npu.worker import talker_multiframe
@@ -419,20 +436,6 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             ids = sampled_token_ids if isinstance(sampled_token_ids, list) else []
             num_reqs = len(ids) or int(getattr(getattr(self, "input_batch", None), "num_reqs", 0) or 0)
             return talker_multiframe.constant_drafts(ids, frames, num_reqs)
-        """Perf #25 (D7): fold the Thinker's terminator tail into the captured
-        verify shape instead of paying an eager 1-token step for it.
-
-        The n-gram drafter copies out of the prompt, which carries the chat
-        template's ``<|im_end|>`` but never ``<|tts_eos|>``, so the draft is
-        structurally wrong at the first terminator of every request. The
-        rewrite is exact under the rejection sampler (a draft token is only
-        emitted when it equals the model's argmax), so the emitted text cannot
-        change; ``VLLM_OMNI_MINICPMO_STAGE0_TAIL_DRAFT=off`` restores stock.
-
-        NOTE: the NPU draft call site passes ``sampled_token_ids`` first
-        (vllm-ascend ``NPUModelRunner.propose_draft_token_ids``); the upstream
-        GPU signature has ``scheduler_output`` first instead.
-        """
         drafts = super().propose_draft_token_ids(sampled_token_ids, *args, **kwargs)
         if stage0_tail_draft.applies(self):
             ids = sampled_token_ids if isinstance(sampled_token_ids, list) else []

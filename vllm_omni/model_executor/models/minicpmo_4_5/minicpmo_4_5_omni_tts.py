@@ -213,7 +213,7 @@ def _p130_probe_observe(request_id, window_dev):
         if probe["batches"] % 20 == 0:
             h = probe["hits"]
             logger.info(
-                "[minicpmo] p130 ngram probe: top-1=%.3f top-2=%.3f top-4=%.3f (n=%d)",
+                "[minicpmo] ngram draft probe: top-1=%.3f top-2=%.3f top-4=%.3f (n=%d)",
                 h[1][0] / max(1, h[1][1]), h[2][0] / max(1, h[2][1]),
                 h[4][0] / max(1, h[4][1]), h[1][1],
             )
@@ -349,17 +349,17 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             self._tts_config = None
             self._codec_eos_id = 0
 
-        # K-step activation (entry_21 K8 line, 910C/A3 target).
-        # OMNI_K_STEP is the frame count per Talker decode step: the value K
-        # (>=2) engages the multi-frame loop -- scheduler schedules K query
-        # positions per request via the vLLM V1 speculative path (constant
-        # `continue` drafts), talker_multiframe.run() replays the decode graph
-        # K times and this model samples one codec frame per replay in-model
-        # (the vLLM-level head degenerates to a one-hot stop/continue row so
-        # the rejection sampler verifies without touching the codec stream).
+        # K-step activation (910C/A3 target).
+        # K is the frame count per Talker decode step: a value >= 2 engages the
+        # multi-frame loop -- the scheduler hands each request K query positions
+        # through the vLLM V1 speculative path (constant `continue` drafts),
+        # talker_multiframe.run() replays the decode graph K times, and this
+        # model samples one codec frame per replay in-model (the vLLM-level head
+        # degenerates to a one-hot stop/continue row so the rejection sampler
+        # verifies without touching the codec stream).
         # SoC guard: the spec-driven verify trips rejection_random_sample_kernel
-        # past the vector-core limit on 910B3, so the gate refuses to arm there
-        # instead of leaving a crash switch behind an env var.
+        # past the vector-core limit on the 910B family, so the gate refuses to
+        # arm there instead of leaving a crash switch behind an env var.
         self._k_step_frames = self._parse_k_step_frames()
         self.supports_multi_frame_decode = self._k_step_frames > 0
         # Per-request device RNG streams for in-model codec sampling (the
@@ -402,10 +402,10 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
         910B family ("Ascend910B1".."Ascend910B4"): rejection_random_sample_
         kernel hits a vector-core limit once the verifier runs K tokens per
-        request (six rounds of entry_21 attempts died there). 910C / A3
-        ("Ascend910_93") is the activation target; unknown future SoCs stay
-        permissive -- the env is a deployment decision and the probe is a
-        guardrail, not the switch.
+        request, which crashed six bring-up attempts before this gate existed.
+        910C / A3 ("Ascend910_93") is the activation target; unknown future
+        SoCs stay permissive -- the env is a deployment decision and the probe
+        is a guardrail, not the switch.
         """
         name = cls._probe_soc_name()
         if name.startswith("Ascend910B"):

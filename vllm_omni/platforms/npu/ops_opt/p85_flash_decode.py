@@ -1,8 +1,8 @@
-"""P85: Triton flash-decode decode-attention（q_len=1 GQA，短 KV，online softmax）。
+"""Triton flash-decode decode-attention（q_len=1 GQA，短 KV，online softmax）。
 
 机理：KV 按 slot 表分块加载、online softmax 单 pass 流式累积，避免整段 KV
 物化。bf16 输入 fp32 累积。
-来源：自行设计（entry_02 P85 描述；Triton-Ascend 内核语法）。
+实现：自研 Triton-Ascend 内核。
 集成点：vllm_omni/platforms/npu/attention/fixed_kv_backend.py 的 decode
 attention 调用处，用本模块 forward 替换原生 gather+matmul+softmax 链。
 env 门：MINICPMO_P85_FLASH_DECODE（默认 "0"，关闭时恒走 torch 回退）。

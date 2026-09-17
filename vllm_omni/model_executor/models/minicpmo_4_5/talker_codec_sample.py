@@ -7,9 +7,10 @@ softmax and ``torch.multinomial`` semantics (including Generator state)
 unchanged.
 
 ``CodecStepGraph`` then captures that whole per-frame chain -- head projection,
-the A14 filter, softmax, multinomial and the state transition -- into a single
-NPUGraph. The filter kernel collapses 41 dispatches; the graph collapses what
-is left, which after the kernel is mostly the ~25 tiny state-transition ops.
+the A14 fused filter (the packaged codec-boundary operator), softmax,
+multinomial and the state transition -- into a single NPUGraph. The filter
+kernel collapses 41 dispatches; the graph collapses what is left, which after
+the kernel is mostly the ~25 tiny state-transition ops.
 """
 
 from __future__ import annotations

@@ -96,7 +96,7 @@ class _ConvRNNF0Predictor(nn.Module):
 
 
 def _fold_weight_norm_modules(root: nn.Module, name: str) -> int:
-    """Perf #17: materialize weight_norm parametrizations into plain weights.
+    """Materialize weight_norm parametrizations into plain weights.
 
     weight_norm recomputes ``g * v / ||v||`` on every forward; after
     load_state_dict the value is constant. Folding it once at load time is a
@@ -215,7 +215,7 @@ class StepAudio2Token2WavCore(nn.Module):
         self._hift.load_state_dict(hift_state_dict, strict=True)
         self._hift.to(self.device).eval()
 
-        # Perf #17: fold weight_norm in flow + HiFT once at load time
+        # Fold weight_norm in flow + HiFT once at load time
         # (bitwise-identical, removes per-forward constant recompute).
         _fold_weight_norm_modules(self._flow, "flow")
         _fold_weight_norm_modules(self._hift, "hift")

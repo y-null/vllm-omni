@@ -1,11 +1,11 @@
-"""p130: 投机采样草稿链（ngram 提议 + 目标模型并行验证）。
+"""投机采样草稿链（ngram 提议 + 目标模型并行验证）。
 
 机理：draft 侧用多尺寸 ngram 前缀表（后缀 tuple -> 候选 Counter）按最长
 匹配提议 K 个音频码；目标模型把 [context + draft[:-1]] 单次前向并行打分，
 贪心接受最长一致前缀，全不中时用末位 logits argmax 回退修正（每步至少
 出 1 token）。接口函数式，可被 talker/codec 逐帧循环或 vllm spec_decode
 钩子复用。
-来源：自行设计（entry_02 p130 描述）。
+来源：自研。
 集成点：minicpmo_4_5_omni_tts.py 的 talker/codec 逐帧生成循环；
 DraftProposer 可特化替换 vllm/v1/spec_decode/ngram_proposer.py。
 env 门：MINICPMO_P130_SPEC_DRAFT（默认 "0"，关闭时 propose 恒返 []，

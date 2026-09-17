@@ -1,10 +1,10 @@
-"""P47: FIA KV 刷新 C++ 化（slot 填写 + 页表更新）。
+"""FIA KV 刷新 C++ 化（slot 填写 + 页表更新）。
 
 机理：把每帧的 KV slot 写入与页表更新从 Python/torch 算子链改为 C++ 扩展
 （并行 memcpy，省多次小 kernel launch 与 Python 开销）。本模块只落源码与
 驱动：预编译 .so 由 MINICPMO_P47_FIA_SO 指定路径后 importlib 加载，未编译
 或未启用时恒走 torch 等价回退（index_copy_ / 高级索引写）。
-来源：自行设计（entry_02 P47 描述，标准 torch extension 结构）。
+来源：自研（标准 torch extension 结构）。
 集成点：fixed_kv_backend.py::OmniFixedKVMetadataBuilder.build 的 slot_mapping
 捕获处与 runner 逐层 KV 写入点。
 env 门：MINICPMO_P47_FIA_CPP（默认 "0"，关闭恒走 torch 回退）。
