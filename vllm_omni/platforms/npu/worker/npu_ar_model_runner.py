@@ -277,6 +277,43 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             knobs = []
         return knobs
 
+    def propose_draft_token_ids(self, valid_sampled_token_ids, *args, **kwargs):
+        """Carry the Talker's frame count to the scheduler, not a prediction.
+
+        Stage 1 declares a speculative_config so that vLLM knows the request
+        advances by K tokens per step -- that is what grows the block table and
+        reserves the KV slots `talker_multiframe` writes into. The drafter
+        itself has nothing to say: the Talker's vLLM-level vocabulary is
+        `continue` and `stop`, the frames are generated sequentially inside one
+        `execute_model`, and the model's own stop row is what ends the request.
+        So the draft is `continue` repeated, and the rejection sampler accepts
+        it exactly up to the frame the codec sequence ended on.
+
+        The frame count comes from `drafts_this_step`, which reads the runner's
+        own `num_spec_tokens` -- the value vLLM derives from the deploy
+        config's speculative_config. Reading it off the model instead would
+        depend on wrappers we do not control.
+
+        NOTE: the NPU draft call site passes ``sampled_token_ids`` first
+        (vllm-ascend ``NPUModelRunner.propose_draft_token_ids``); the upstream
+        GPU signature has ``scheduler_output`` first instead.
+        """
+        from vllm_omni.platforms.npu.worker import talker_multiframe
+
+        frames = talker_multiframe.drafts_this_step(self)
+        if frames > 1:
+            return talker_multiframe.constant_drafts(
+                valid_sampled_token_ids, frames, self.input_batch.num_reqs
+            )
+        drafts = super().propose_draft_token_ids(valid_sampled_token_ids, *args, **kwargs)
+        if stage0_tail_draft.applies(self):
+            drafts = stage0_tail_draft.rewrite(
+                drafts,
+                valid_sampled_token_ids,
+                self.speculative_config.num_speculative_tokens,
+            )
+        return drafts
+
     def _update_states(self, scheduler_output: SchedulerOutput):
         deferred_state_corrections_fn = super()._update_states(scheduler_output)
         self._update_duplex_sampling_states(scheduler_output)

@@ -625,6 +625,30 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
 
         raise ValueError(f"Unsupported model stage: {self.model_stage}")
 
+    # The multi-frame decode loop drives the Talker one frame at a time, so it
+    # needs the per-frame stop rows and the merge. Both are the Talker's, and
+    # the runner only ever sees this wrapper, so the forwarding has to exist
+    # here rather than being reached through `self.talker`. The marker below is
+    # what the loop actually gates on: these methods are on the class for both
+    # stages, and the Thinker (stage 0) must never take this path -- hence the
+    # model_stage checks rather than a plain delegation.
+    @property
+    def supports_multi_frame_decode(self) -> bool:
+        return self.model_stage == "tts"
+
+    def take_batch_stop_logits(self):
+        if self.model_stage != "tts":
+            return None
+        return self.talker.take_batch_stop_logits()
+
+    def set_batch_stop_logits(self, logits) -> None:
+        if self.model_stage != "tts":
+            return
+        self.talker.set_batch_stop_logits(logits)
+
+    def merge_frame_outputs(self, frame_outputs, frame_stop_logits):
+        return self.talker.merge_frame_outputs(frame_outputs, frame_stop_logits)
+
     def make_omni_output(self, model_outputs, **kwargs):
         if self.model_stage != "tts":
             return model_outputs
