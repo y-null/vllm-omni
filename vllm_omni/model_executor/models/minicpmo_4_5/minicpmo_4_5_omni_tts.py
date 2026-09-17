@@ -373,6 +373,18 @@ def resolve_codec_sampling_params(
     return resolved
 
 
+
+def _codec_int_param(state: Any, key: str, fallback: int) -> int:
+    """Read an integer codec knob from a request state, None meaning unset.
+
+    ``dict.get(key, fallback)`` does not help when the key is present but holds
+    None -- which the offline duplex path uses to mean "the deploy YAML owns
+    this knob" -- so None is mapped to the fallback explicitly here. Kept in
+    one place so every reader agrees on the rule.
+    """
+    value = state.get(key) if isinstance(state, Mapping) else None
+    return int(fallback if value is None else value)
+
 class _MiniCPMTTSProjector(nn.Module):
     """Checkpoint-compatible hidden-state projector used by MiniCPMTTS."""
 
@@ -849,7 +861,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 if not isinstance(base_recent_codes, tuple):
                     raise ValueError("streaming Talker condition lost its frozen codec history")
                 retained_codes = list(base_recent_codes)
-            offset = int(info_dict.get("_omni_num_computed_tokens", 0))
+            offset = max(0, int(info_dict.get("_omni_num_computed_tokens", 0) or 0))
             # The handoff rebuilds only the tail-aligned Talker condition.
             # Materialize zero-token embeddings for any scheduler prompt
             # prefix so chunked prefill can slice from a non-zero offset.
@@ -886,7 +898,11 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 # min_new_token=50) comes from the deploy YAML.
                 remaining = int(self._tts_config.max_position_embeddings) - target_len
                 max_tokens = max(min(_OFFLINE_CODEC_MAX_NEW_TOKENS, remaining), 1)
-                min_tokens = None
+                # The sampler floor the old comment pointed at (upstream's
+                # min_new_token, resolved from the deploy YAML or the
+                # checkpoint). A None here would reach make_omni_output as a
+                # value, and int(None) kills the stage.
+                min_tokens = int(self._codec_min_tokens)
             state: dict[str, Any] = {
                 "finished": empty_condition,
                 "step": 0,
@@ -1091,9 +1107,9 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 codes = torch.empty(0, dtype=torch.long, device=hidden.device)
             else:
                 codes = codes.to(device=hidden.device, dtype=torch.long).reshape(-1)
-            step = int(state.get("step", 0))
-            min_tokens = int(state.get("min_tokens", self._codec_min_tokens))
-            max_tokens = int(state.get("max_tokens", self._codec_max_tokens))
+            step = _codec_int_param(state, "step", 0)
+            min_tokens = _codec_int_param(state, "min_tokens", self._codec_min_tokens)
+            max_tokens = _codec_int_param(state, "max_tokens", self._codec_max_tokens)
             if self._codec_temperature == 0.0:
                 sampled = self._sample_audio_code_greedy(
                     hidden[end - 1 : end],
@@ -1120,7 +1136,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 # not add a second mid-frame synchronization here.
                 if sampled_result is None:
                     raise RuntimeError("the A14 codec boundary needs device-resident sample state")
-                state["step"] = int(state.get("step", 0)) + 1
+                state["step"] = _codec_int_param(state, "step", 0) + 1
                 info["audio_state"] = state
                 info["audio_codes"] = {
                     "current": sampled.reshape(1),
@@ -1144,8 +1160,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 continue
             sampled_id = int(sampled.item())
             is_eos = sampled_id == self._num_audio_tokens - 1
-            state["step"] = int(state.get("step", 0)) + 1
-            reached_limit = int(state["step"]) >= int(state.get("max_tokens", self._codec_max_tokens))
+            state["step"] = _codec_int_param(state, "step", 0) + 1
+            reached_limit = int(state["step"]) >= _codec_int_param(state, "max_tokens", self._codec_max_tokens)
             finished = is_eos or reached_limit
             state["finished"] = finished
             # MiniCPMTTS.generate_chunk consumes the boundary sample but
@@ -1365,7 +1381,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             device_state = make_device_state(
                 history,
                 step=step,
-                max_tokens=int(request_state.get("max_tokens", self._codec_max_tokens)),
+                max_tokens=_codec_int_param(request_state, "max_tokens", self._codec_max_tokens),
                 finished=False,
             )
             device_states[request_id] = device_state
@@ -1379,7 +1395,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             request_state = request_states.get(request_id, {})
             device_inputs = (
                 torch.tensor(
-                    [int(request_state.get("min_tokens", self._codec_min_tokens))],
+                    [_codec_int_param(request_state, "min_tokens", self._codec_min_tokens)],
                     dtype=torch.int32,
                     device=hidden_state.device,
                 ),
