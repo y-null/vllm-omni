@@ -51,18 +51,6 @@ def prepare_code2wav_graph_runtime() -> None:
     npu = torch.npu
     npu.config.allow_internal_format = False
     npu.set_compile_mode(jit_compile=False)
-    # P93: flow DiT adaLN fusion. It has to happen HERE and not later: it
-    # rebinds DiTBlock's methods and Stage 2 captures an NPU graph over the
-    # flow afterwards, so a later rebind would leave the graph replaying the
-    # old operator chain forever. This function runs from
-    # _patched_build_backend() before any Token2Wav is constructed.
-    try:
-        from vllm_omni.platforms.npu.models import p93_dit_fused
-
-        p93_dit_fused.install()
-        logger.info("P93 fused adaLN counters: %s", p93_dit_fused.counters())
-    except Exception as error:  # pragma: no cover - a host without triton
-        logger.warning("P93 fused adaLN not installed: %s", error)
     logger.info("Configured MiniCPM-o Code2Wav NPUGraph runtime (allow_internal_format=False, jit_compile=False)")
 
 
