@@ -143,11 +143,30 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         self._init_duplex_sampling_state()
         # Perf N5/T6: steady-state decode input reuse (see decode_prep_fast).
         self._decode_input_cache = decode_prep_fast.DecodeInputCache()
+        # K-step: read the arm state off the model as soon as it exists so
+        # every later path (graph capture included) sees num_spec_tokens.
+        self._arm_k_step()
         #  -------------------------------------- Omni-new -------------------------------------------------
+
+    def _arm_k_step(self) -> int:
+        """Mirror the model's K-step arm onto this runner.
+
+        vLLM V1 grows a request's per-step token allocation only through the
+        speculative path, so the K-frame decode borrows it: num_spec_tokens
+        K-1 makes the scheduler reserve K query positions per request, which
+        the multi-frame loop then replays sequentially (nothing is actually
+        speculative -- the drafts are the constant `continue` id and the
+        frames are generated, not verified, through it).
+        """
+        frames = int(getattr(getattr(self, "model", None), "_k_step_frames", 0) or 0)
+        if frames > 1:
+            self.num_spec_tokens = frames - 1
+        return frames
 
     def load_model(self, *args, **kwargs) -> None:
         super().load_model(*args, **kwargs)
         self._resolve_duplex_sampling_hook(force=True)
+        self._arm_k_step()
 
     @contextlib.contextmanager
     def _narrow_decode_query_len(self):
@@ -233,7 +252,173 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         decode_prep_fast.note_generic(self, scheduler_output, num_scheduled_tokens, result)
         return result
 
+    def _k_step_sampling_knobs(self, num_reqs: int) -> list[dict]:
+        """Per-request sampling knobs for the in-model codec sampler.
+
+        The K-frame loop cannot run the vLLM host sampler per frame, so the
+        runner hands the model each request's generation params (penalty /
+        temperature) up front; anything missing falls back to the model's
+        generate()-time defaults.
+        """
+        knobs: list[dict] = []
+        try:
+            params = self.input_batch.sampling_params
+            for index in range(num_reqs):
+                p = params[index] if index < len(params) else None
+                knobs.append(
+                    {
+                        "penalty": float(getattr(p, "repetition_penalty", 1.0) or 1.0),
+                        "temperature": float(getattr(p, "temperature", 1.0) or 1.0),
+                        "top_k": int(getattr(p, "top_k", 0) or 0),
+                        "top_p": float(getattr(p, "top_p", 1.0) or 1.0),
+                    }
+                )
+        except Exception:
+            knobs = []
+        return knobs
+
+    def _k_step_replay(
+        self,
+        replay_args: tuple,
+        model_kwargs: dict,
+        model_kwargs_extra: dict,
+    ):
+        """One graph replay of the multi-frame loop -- raw hidden out.
+
+        Bypasses the omni wrapper's ``_model_forward``: its tail wraps the
+        model output with ``make_omni_output`` using the step-wide token
+        spans, while the loop samples each frame itself with per-frame spans
+        (``talker_multiframe.run`` calls ``make_omni_output`` per frame).
+        The omni decode metadata refresh below is idempotent per replay.
+        ``replay_args`` carries the caller's original positional arguments
+        (num_tokens_padded, input_ids, positions, ...).
+        """
+        from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
+
+        arg_names = ("num_tokens_padded", "input_ids", "positions", "intermediate_tensors", "inputs_embeds")
+        named = dict(zip(arg_names, replay_args))
+        update = getattr(self.model, "update_decode_step_metadata", None)
+        if getattr(self.model, "supports_omni_decode_step_metadata", False) and callable(update):
+            update(
+                input_ids=named.get("input_ids"),
+                positions=named.get("positions"),
+                inputs_embeds=named.get("inputs_embeds"),
+                omni_query_start_loc=model_kwargs_extra.get("omni_query_start_loc"),
+                req_ids=self.input_batch.req_ids,
+            )
+        return super(OmniGPUModelRunner, self)._model_forward(
+            *replay_args,
+            **model_kwargs,
+            **model_kwargs_extra,
+        )
+
+    @staticmethod
+    def _k_step_replay_args(args: tuple, kwargs: dict) -> tuple:
+        """The positional-argument prefix ``execute_model`` calls us with
+        (num_tokens_padded, input_ids, positions, intermediate_tensors,
+        inputs_embeds), possibly spread into keywords instead."""
+        base = (
+            kwargs.get("num_tokens_padded"),
+            kwargs.get("input_ids"),
+            kwargs.get("positions"),
+            kwargs.get("intermediate_tensors"),
+            kwargs.get("inputs_embeds"),
+        )
+        merged = list(base)
+        for index, value in enumerate(args[:5]):
+            if value is not None:
+                merged[index] = value
+        # Drop the trailing Nones the caller did not pass positionally so the
+        # replay call keeps the original arity.
+        while merged and merged[-1] is None:
+            merged.pop()
+        return tuple(merged)
+
+    def _model_forward(self, *args, **model_kwargs):
+        """K-step Talker branch: run the multi-frame loop when armed.
+
+        Off (OMNI_K_STEP unset / SoC guard / non-decode step) this defers
+        entirely to the omni wrapper, so the ordinary one-frame path is
+        untouched. On, a pure decode step over the Talker replays the
+        captured decode graph K times; each replay samples one codec frame
+        in-model and the vLLM-level head degenerates to one-hot stop/continue
+        rows the rejection sampler verifies the constant ``continue`` drafts
+        against (see MiniCPMO45OmniTTS._k_step_frame_output).
+        """
+        frames = int(getattr(getattr(self, "model", None), "_k_step_frames", 0) or 0)
+        if frames <= 0:
+            return super()._model_forward(*args, **model_kwargs)
+        from vllm_omni.platforms.npu.worker import talker_multiframe
+
+        model_kwargs_extra = self._build_model_kwargs_extra()
+        scheduled = talker_multiframe.applies(self.model, model_kwargs_extra)
+        if scheduled <= 0:
+            if talker_multiframe.is_multi_token_decode(self.model, model_kwargs_extra):
+                raise RuntimeError(
+                    "MiniCPM-o K-step: this Talker step scheduled several "
+                    "tokens per request but the multi-frame loop refused it; "
+                    "running the single-forward path would corrupt the codec "
+                    "stream. Refusing to continue."
+                )
+            return super()._model_forward(*args, **model_kwargs)
+        spans = model_kwargs_extra["request_token_spans"]
+        model_kwargs_extra["omni_k_sampling"] = self._k_step_sampling_knobs(len(spans))
+        replay_args = self._k_step_replay_args(args, model_kwargs)
+        forward_context = None
+        try:
+            from vllm.forward_context import get_forward_context
+
+            forward_context = get_forward_context()
+        except Exception:
+            forward_context = None
+        narrow = None
+        if forward_context is not None:
+            narrow = talker_multiframe.begin_narrow_step(
+                runner=self,
+                forward_context=forward_context,
+                frames=scheduled,
+                positions=replay_args[2] if len(replay_args) > 2 else model_kwargs.get("positions"),
+                inputs_embeds=(
+                    replay_args[4] if len(replay_args) > 4 else model_kwargs.get("inputs_embeds")
+                ),
+                spans=spans,
+            )
+        try:
+            merged = talker_multiframe.run(
+                model=self.model,
+                run_model=lambda: self._k_step_replay(
+                    replay_args,
+                    model_kwargs,
+                    model_kwargs_extra,
+                ),
+                after_forward=lambda: None,
+                inputs_embeds=(
+                    replay_args[4] if len(replay_args) > 4 else model_kwargs.get("inputs_embeds")
+                ),
+                input_ids=replay_args[1] if len(replay_args) > 1 else model_kwargs.get("input_ids"),
+                frames=scheduled,
+                model_kwargs=model_kwargs,
+                model_kwargs_extra=model_kwargs_extra,
+                narrow=narrow,
+            )
+        finally:
+            if forward_context is not None:
+                talker_multiframe.end_narrow_step(forward_context, narrow)
+        talker_multiframe.ensure_stop_token_vocab(self, merged.text_hidden_states)
+        self._omni_last_model_output = merged
+        return merged
+
     def propose_draft_token_ids(self, sampled_token_ids, *args, **kwargs):
+        # K-step: the Talker's "drafts" are the constant continue id -- the
+        # loop generates the K frames through the speculative slots; nothing
+        # is copied from the prompt.
+        frames = int(getattr(getattr(self, "model", None), "_k_step_frames", 0) or 0)
+        if frames > 1:
+            from vllm_omni.platforms.npu.worker import talker_multiframe
+
+            ids = sampled_token_ids if isinstance(sampled_token_ids, list) else []
+            num_reqs = len(ids) or int(getattr(getattr(self, "input_batch", None), "num_reqs", 0) or 0)
+            return talker_multiframe.constant_drafts(ids, frames, num_reqs)
         """Perf #25 (D7): fold the Thinker's terminator tail into the captured
         verify shape instead of paying an eager 1-token step for it.
 
@@ -278,6 +463,9 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
 
     #  -------------------------------------- Omni-new -------------------------------------------------
     def capture_model(self) -> int:
+        # K-step must arm before capture: the narrow fixed-KV graph only
+        # registers when the runner already reports num_spec_tokens.
+        self._arm_k_step()
         npugraph_memory_bytes = super().capture_model()
         self._capture_talker_mtp_graphs()
         return npugraph_memory_bytes

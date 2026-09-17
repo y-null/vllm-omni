@@ -113,6 +113,18 @@ stages:
     devices: "0"
     output_connectors:
       to_stage_2: connector_of_shared_memory
+    # K-step (910C/A3 only; 910B3's rejection kernel cannot verify
+    # spec-width rows). Uncomment together with OMNI_K_STEP=8 on the serve
+    # env: the speculative shell is what makes vLLM V1 schedule K query
+    # positions per Talker request; the runner's constant `continue` drafts
+    # and the multi-frame loop then generate the K codec frames through
+    # those slots. num_speculative_tokens must be OMNI_K_STEP - 1.
+    # speculative_config:
+    #   method: ngram
+    #   num_speculative_tokens: 7
+    #   prompt_lookup_min: 1
+    #   prompt_lookup_max: 1
+    #
     # Talker is a single-vocab codec LM. These knobs go to vLLM's Sampler
     # (head_code logits). EOS is tts_config.eos_token_id (num_audio_tokens-1).
     # Values track upstream utils.TTSSamplingParams (min_p/win_size/tau_r are
@@ -189,11 +201,6 @@ platforms:
           # refuses its binary inside the stage process (ACL 161001, SoC not
           # configured). Keep the FIA path until that is resolved.
           VLLM_OMNI_TALKER_DECODE_OP: "1"
-          # P93 fused adaLN measures as a regression on 910B3 (fused counters
-          # stayed 0 and 32/1 RTF went 0.461 -> 0.487), so it ships off
-          # here. entry_02 measured 8.45x on the block on 910C -- A/B it
-          # there with VLLM_OMNI_P93_FUSED_ADALN=1.
-          VLLM_OMNI_P93_FUSED_ADALN: "0"
           OMNI_STEP_PROF_FLUSH: "200"
       - stage_id: 2
         max_num_seqs: 8
