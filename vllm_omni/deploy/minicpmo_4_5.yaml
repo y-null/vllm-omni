@@ -156,10 +156,11 @@ platforms:
           # expansion (PIECEWISE silently disables them).
           cudagraph_mode: FULL_AND_PIECEWISE
         env:
-          # A14 is the packaged fused codec-boundary operator. Prefer it and
-          # its whole-step graph; fall back to the native sampler when the
-          # operator payload is absent.
-          VLLM_OMNI_A14_MODE: auto
+          # A14 is the packaged fused codec-boundary operator. Left off: its
+          # binary corrupts the heap on 910B and faults the vector core on
+          # 910_93 (see talker_codec_sample.a14_mode). Set
+          # VLLM_OMNI_A14_MODE=auto once a payload is verified for the part.
+          VLLM_OMNI_A14_MODE: off
           VLLM_OMNI_A14_GRAPH: "1"
       - stage_id: 2
         max_num_seqs: 8

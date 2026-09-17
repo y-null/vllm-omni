@@ -498,7 +498,6 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
             )
         if frames > 1:
             spans = [(int(start), int(end)) for start, end in model_kwargs_extra["request_token_spans"]]
-            model_kwargs_extra["omni_k_sampling"] = self._k_step_sampling_knobs(len(spans))
             narrow = talker_multiframe.begin_narrow_step(
                 runner=self,
                 forward_context=forward_context,

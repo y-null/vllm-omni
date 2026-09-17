@@ -68,13 +68,17 @@ def a14_mode() -> str:
     development bridge implies ``required`` for backwards-compatible PoC
     commands.
 
-    The default is deliberately not ``off``: the official evaluation starts
-    the server with no vLLM-Omni environment variables, so anything gated
-    behind one is dead on arrival.
+    The default is ``off``. The packaged operator binary is not safe to enable
+    blindly: the rebuilt 910B payload passes its numeric self-test and then
+    corrupts the heap ("corrupted size vs. prev_size", core dump), and on the
+    910_93 part the same package faults its vector core (acl error 507035,
+    "scalar ... out of bounds") both in the Triton warmup and during the
+    one-query graph capture. A sampling speedup does not pay for a crash, and
+    ``auto``/``required`` stay available for a payload verified on the target.
     """
     configured = os.environ.get(_A14_MODE_ENV)
     if configured is None:
-        return "required" if os.environ.get(_A14_EXTENSION_ENV) else "auto"
+        return "required" if os.environ.get(_A14_EXTENSION_ENV) else "off"
     mode = configured.strip().lower()
     if mode not in {"auto", "off", "required"}:
         raise RuntimeError(f"{_A14_MODE_ENV} must be 'auto', 'off' or 'required', got {configured!r}")
