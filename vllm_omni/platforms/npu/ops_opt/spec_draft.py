@@ -15,7 +15,7 @@ import os
 from collections import Counter
 from typing import Callable, List, Sequence, Tuple
 
-_P130_ENABLED = os.environ.get("MINICPMO_P130_SPEC_DRAFT", "0") == "1"
+_SPEC_DRAFT_ENABLED = os.environ.get("MINICPMO_P130_SPEC_DRAFT", "0") == "1"
 
 
 class DraftProposer:
@@ -39,7 +39,7 @@ class DraftProposer:
 
     def propose(self, context: Sequence[int], k: int) -> List[int]:
         """最长匹配后缀优先；env 关闭恒返 []。"""
-        if not _P130_ENABLED or k <= 0 or not self._table:
+        if not _SPEC_DRAFT_ENABLED or k <= 0 or not self._table:
             return []
         ctx = list(context)
         for n in range(min(self.max_suffix, len(ctx)), self.min_suffix - 1, -1):

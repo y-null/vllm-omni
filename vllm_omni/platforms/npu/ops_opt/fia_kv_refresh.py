@@ -14,7 +14,7 @@ import os
 
 import torch
 
-_P47_ENABLED = os.environ.get("MINICPMO_P47_FIA_CPP", "0") == "1"
+_FIA_KV_ENABLED = os.environ.get("MINICPMO_P47_FIA_CPP", "0") == "1"
 _CPP_SOURCE = r'''
 #include <torch/extension.h>
 #include <cstring>
@@ -85,7 +85,7 @@ def save_source(path):
 
 def fill_kv_slots(cache, rows, slot_ids):
     """等价 torch 回退：cache.index_copy_(0, slot_ids, rows)。"""
-    ext = _load_ext() if _P47_ENABLED else None
+    ext = _load_ext() if _FIA_KV_ENABLED else None
     if ext is not None:
         return ext.fill_kv_slots(cache, rows, slot_ids.to(torch.long))
     cache.index_copy_(0, slot_ids.to(torch.long), rows)
@@ -94,7 +94,7 @@ def fill_kv_slots(cache, rows, slot_ids):
 
 def update_page_table(page_table, seq_lens, new_slots):
     """等价 torch 回退：page_table[arange(B), seq_lens] = new_slots。"""
-    ext = _load_ext() if _P47_ENABLED else None
+    ext = _load_ext() if _FIA_KV_ENABLED else None
     if ext is not None:
         return ext.update_page_table(page_table, seq_lens.to(torch.long), new_slots.to(torch.long))
     b = page_table.shape[0]

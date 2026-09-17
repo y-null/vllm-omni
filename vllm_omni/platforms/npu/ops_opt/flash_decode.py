@@ -11,7 +11,7 @@ import os
 
 import torch
 
-_P85_ENABLED = os.environ.get("MINICPMO_P85_FLASH_DECODE", "0") == "1"
+_FLASH_DECODE_ENABLED = os.environ.get("MINICPMO_P85_FLASH_DECODE", "0") == "1"
 
 try:
     import triton
@@ -87,7 +87,7 @@ def _flash_decode_torch(q, k_cache, v_cache, kv_indices, seq_lens):
 
 def flash_decode(q, k_cache, v_cache, kv_indices, seq_lens, block_kv=64):
     """q (B,H,D)；k/v_cache (slots,KVH,D)；kv_indices (B,L) slot 表；seq_lens (B,)。"""
-    if not (_P85_ENABLED and _HAS_TRITON):
+    if not (_FLASH_DECODE_ENABLED and _HAS_TRITON):
         return _flash_decode_torch(q, k_cache, v_cache, kv_indices, seq_lens)
     b, h, d = q.shape
     kvh = k_cache.shape[1]

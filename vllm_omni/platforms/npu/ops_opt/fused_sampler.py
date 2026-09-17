@@ -12,7 +12,7 @@ import os
 
 import torch
 
-_P156_ENABLED = os.environ.get("MINICPMO_P156_FUSED_SAMPLER", "0") == "1"
+_FUSED_SAMPLER_ENABLED = os.environ.get("MINICPMO_P156_FUSED_SAMPLER", "0") == "1"
 
 try:
     import torch_npu  # noqa: F401
@@ -54,7 +54,7 @@ def reference_top_k_top_p(logits, top_k=None, top_p=None, min_tokens_to_keep=3):
 
 def fused_top_k_top_p(logits, top_k, top_p):
     """融合核路径；失败自动回落参考实现。"""
-    if not (_P156_ENABLED and _HAS_NPU):
+    if not (_FUSED_SAMPLER_ENABLED and _HAS_NPU):
         return reference_top_k_top_p(logits, top_k=top_k, top_p=top_p)
     p_dev, k_dev = _device_constants(str(logits.device), logits.dtype, top_p, top_k)
     try:

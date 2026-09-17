@@ -161,30 +161,30 @@ def _apply_top_k_top_p(
 
 
 _NPU_TOPK_CACHE: dict = {}
-_P156_FUSED = None
-if os.environ.get("MINICPMO_P156_FUSED_SAMPLER", "0") == "1":
+_FUSED_SAMPLER = None
+if os.environ.get("MINICPMO_FUSED_SAMPLER_SAMPLER", "0") == "1":
     try:
-        from vllm_omni.platforms.npu.ops_opt import p156_fused_sampler as _P156_FUSED  # noqa: F811
+        from vllm_omni.platforms.npu.ops_opt import fused_sampler as _FUSED_SAMPLER  # noqa: F811
     except Exception:
-        _P156_FUSED = None
+        _FUSED_SAMPLER = None
 
 # p130 online feasibility probe (observe-only): scores the ngram draft
 # proposer's top-1/2/4 recall on the live codec stream to decide whether
 # spec-decode integration is worth building. Never changes a sampled id.
-_P130_MOD = None
-if os.environ.get("MINICPMO_P130_PROBE", "0") == "1":
+_SPEC_DRAFT_MOD = None
+if os.environ.get("MINICPMO_SPEC_DRAFT_PROBE", "0") == "1":
     try:
-        from vllm_omni.platforms.npu.ops_opt import p130_spec_draft as _P130_MOD
+        from vllm_omni.platforms.npu.ops_opt import spec_draft as _SPEC_DRAFT_MOD
     except Exception:
-        _P130_MOD = None
-_P130_PROBE: dict = {"buf": {}, "hits": {k: [0, 0] for k in (1, 2, 4)}, "batches": 0, "seen": 0}
+        _SPEC_DRAFT_MOD = None
+_SPEC_DRAFT_PROBE: dict = {"buf": {}, "hits": {k: [0, 0] for k in (1, 2, 4)}, "batches": 0, "seen": 0}
 
 
-def _p130_probe_observe(request_id, window_dev):
-    if _P130_MOD is None:
+def _spec_draft_probe_observe(request_id, window_dev):
+    if _SPEC_DRAFT_MOD is None:
         return
     try:
-        probe = _P130_PROBE
+        probe = _SPEC_DRAFT_PROBE
         buf = probe["buf"].setdefault(request_id, [])
         buf.append(window_dev)
         if sum(b.numel() for b in buf) < 256:
@@ -195,7 +195,7 @@ def _p130_probe_observe(request_id, window_dev):
         if p is None or len(data) < 40:
             return
         if probe["seen"] > 12000:  # keep the ngram table windowed
-            probe["proposer"] = p = _P130_MOD.DraftProposer()
+            probe["proposer"] = p = _SPEC_DRAFT_MOD.DraftProposer()
             probe["seen"] = 0
         hist, fresh = data[:-16], data[-16:]
         p.observe(hist)
@@ -963,8 +963,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 else:
                     window = new_code.clone()
                 penalty_windows[request_id] = window[-_CODEC_PENALTY_WINDOW:]
-                if _P130_MOD is not None:
-                    _p130_probe_observe(request_id, window[-_CODEC_PENALTY_WINDOW:])
+                if _SPEC_DRAFT_MOD is not None:
+                    _spec_draft_probe_observe(request_id, window[-_CODEC_PENALTY_WINDOW:])
                 # Incremental repetition histogram: evict exactly the oldest
                 # window token and count the fresh one (+1/-1 index_add_), so
                 # sample() never rebuilds a vocab-wide bincount per step.
