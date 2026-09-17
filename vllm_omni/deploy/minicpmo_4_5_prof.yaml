@@ -110,24 +110,11 @@ stages:
     devices: "0"
     output_connectors:
       to_stage_2: connector_of_shared_memory
-    # K-step is injected by code, not configured here. On 910C/A3 the loader
-    # (config/stage_config.py: _apply_minicpmo_talker_multiframe_default) adds
-    # a speculative_config with num_speculative_tokens = K-1 and turns
-    # async_scheduling off, because vLLM refuses async scheduling next to an
-    # n-gram proposer. K defaults to 8; VLLM_OMNI_MINICPMO_TALKER_FRAMES sets
-    # it (1 = off, 16 = the entry_21 maximum). Nothing is injected on the
-    # 910B family, whose rejection verifier cannot take spec-width rows.
-    #
-    # Writing an explicit speculative_config below is still allowed and wins
-    # over the default -- but then this stage MUST also carry
-    # `async_scheduling: false`, or the orchestrator dies in
-    # VllmConfig validation before any worker spawns.
-    # speculative_config:
-    #   method: ngram
-    #   num_speculative_tokens: 7
-    #   prompt_lookup_min: 1
-    #   prompt_lookup_max: 1
-    # async_scheduling: false
+    # K-step (Talker multi-frame) is injected by code, not configured here:
+    # config/stage_config.py adds the stage-1 speculative_config and clears
+    # async_scheduling on 910C/A3. K defaults to 8; the environment variable
+    # VLLM_OMNI_MINICPMO_TALKER_FRAMES overrides it (1 = off, 16 = max).
+    # The 910B family gets nothing (its rejection verifier cannot take K rows).
     #
     # Talker is a single-vocab codec LM. These knobs go to vLLM's Sampler
     # (head_code logits). EOS is tts_config.eos_token_id (num_audio_tokens-1).
