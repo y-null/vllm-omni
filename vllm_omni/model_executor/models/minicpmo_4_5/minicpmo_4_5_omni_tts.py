@@ -349,6 +349,19 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             self._tts_config = None
             self._codec_eos_id = 0
 
+        # K-step Phase1 gate (multiframe paired recovery, entry_21 K8 line).
+        # The ported talker_multiframe.run() loop + one-query narrow replay
+        # only engage when the scheduler hands the Talker multi-token spans
+        # AND the model advertises this flag (talker_multiframe.applies reads
+        # it first). 910B3 keeps it off: the spec-driven verify that produces
+        # the spans trips rejection_random_sample_kernel past the vector-core
+        # limit there. 910C/A3 starts activation with OMNI_K_STEP=1 (K=1
+        # byte-equivalence first, then K=8).
+        self.supports_multi_frame_decode = (
+            os.environ.get("OMNI_K_STEP", "0").strip().lower()
+            not in ("", "0", "off", "false", "no")
+        )
+
         self.has_preprocess = True
         self.has_postprocess = False
         # Same-step codes travel through make_omni_output from the previous
