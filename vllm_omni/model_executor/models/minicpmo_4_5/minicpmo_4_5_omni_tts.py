@@ -400,23 +400,35 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
     def _soc_allows_k_step(cls) -> bool:
         """False on SoCs whose rejection kernel cannot take spec-width rows.
 
-        910B family ("Ascend910B1".."Ascend910B4"): rejection_random_sample_
-        kernel hits a vector-core limit once the verifier runs K tokens per
-        request, which crashed six bring-up attempts before this gate existed.
-        910C / A3 ("Ascend910_93") is the activation target; unknown future
-        SoCs stay permissive -- the env is a deployment decision and the probe
-        is a guardrail, not the switch.
+        910B family: rejection_random_sample_kernel hits a vector-core limit
+        once the verifier runs K tokens per request, which crashed six bring-up
+        attempts before this gate existed. 910C / A3 is the activation target.
+
+        The environment is consulted first ("ascend910b1" on 910B,
+        "ascend910_9391" on 910C) because the deploy-config gate that decides
+        whether to inject the speculative_config sees only the environment --
+        both sides have to agree on the same input. The device probe is a
+        fallback for a worker whose launch environment lacks the variables;
+        inside a worker the device is already initialised, so probing here
+        costs nothing. An unidentifiable SoC refuses: leaving the frame loop
+        off is a slower run, speccing a 910B faults the kernel.
         """
-        name = cls._probe_soc_name()
-        if name.startswith("Ascend910B"):
+        from vllm_omni.config.stage_config import _soc_name_from_env
+
+        name = _soc_name_from_env() or cls._probe_soc_name()
+        if name.lower().startswith("ascend910b"):
             logger.warning(
-                "[minicpmo] SoC probe: %r is a 910B part -- K-step spec-width "
-                "verify is not supported there (rejection kernel limit).",
+                "[minicpmo] SoC: %r is a 910B part -- K-step spec-width verify "
+                "is not supported there (rejection kernel limit).",
                 name,
             )
             return False
-        if name:
-            logger.info("[minicpmo] SoC probe: %r", name)
+        if not name:
+            logger.warning(
+                "[minicpmo] SoC not identified; leaving the K-step loop off.",
+            )
+            return False
+        logger.info("[minicpmo] SoC: %r", name)
         return True
 
     @classmethod
@@ -426,32 +438,40 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         The count comes from ``config.stage_config.talker_frames_per_step`` --
         the very function the deploy-config loader uses to size the injected
         speculative_config -- so the runner and the scheduler cannot disagree
-        about K. ``OMNI_K_STEP`` overrides it for experiments (the older flag
-        name, still honoured).
+        about K. An explicit ``VLLM_OMNI_MINICPMO_TALKER_FRAMES`` (or the older
+        ``OMNI_K_STEP``) skips the SoC gate, exactly as the loader does for the
+        same input; that keeps the two sides aligned even when an operator
+        forces the loop on by hand.
         """
-        raw = os.environ.get("OMNI_K_STEP", "").strip().lower()
-        if raw in ("", "0", "off", "false", "no"):
-            from vllm_omni.config.stage_config import talker_frames_per_step
+        from vllm_omni.config.stage_config import (
+            _MINICPMO_FRAMES_OFF,
+            _MINICPMO_TALKER_FRAMES_ENV,
+            talker_frames_per_step,
+        )
 
-            frames = talker_frames_per_step()
-        else:
+        raw = os.environ.get("OMNI_K_STEP", "").strip().lower()
+        explicit = os.environ.get(_MINICPMO_TALKER_FRAMES_ENV, "").strip().lower()
+        if raw not in ("", "0", "off", "false", "no"):
             try:
                 frames = int(raw)
             except ValueError:
                 raise ValueError(
                     f"OMNI_K_STEP must be an integer frame count (>=2), got {raw!r}"
                 ) from None
+            explicit = "forced"
+        else:
+            frames = talker_frames_per_step()
         if frames < 2:
             # K=1 degenerates to the ordinary one-frame path; treat it as off
             # so the flag never silently half-arms the pipeline.
             return 0
         if frames > 16:
-            raise ValueError(f"OMNI_K_STEP is capped at 16, got {frames}")
-        if not cls._soc_allows_k_step():
+            raise ValueError(f"K-step frame count is capped at 16, got {frames}")
+        forced = explicit not in ("",) + _MINICPMO_FRAMES_OFF
+        if not forced and not cls._soc_allows_k_step():
             logger.warning(
-                "[minicpmo] K-step decode left off: this SoC's rejection kernel "
-                "cannot verify spec-width rows (910B family limit). Deploy on "
-                "910C/A3 (Ascend910_93).",
+                "[minicpmo] K-step decode left off: the SoC either cannot verify "
+                "spec-width rows (910B family limit) or was not identified.",
             )
             return 0
         logger.info("[minicpmo] Talker K-step decode armed: %d codec frames per step", frames)

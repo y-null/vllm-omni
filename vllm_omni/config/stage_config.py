@@ -809,26 +809,44 @@ _MINICPMO_TALKER_FRAMES_MAX = 16
 _MINICPMO_FRAMES_OFF = ("0", "1", "off", "false", "no")
 
 
+_SOC_ENV_VARS = ("VLLM_OMNI_A14_SOC", "SOC_VERSION", "ASCEND_SOC_VERSION")
+
+
+def _soc_name_from_env() -> str:
+    """SoC identifier from the launch environment. Never touches the device.
+
+    Asking torch_npu for the device name here would initialise the NPU in
+    whichever process loads the deploy config -- the API server -- and that
+    process would then hold device memory it has no use for, which shows up as
+    an extra entry in npu-smi. CANN launch environments already export the
+    revision: ``ascend910b1`` on a 910B box, ``ascend910_9391`` on 910C.
+    """
+    for variable in _SOC_ENV_VARS:
+        value = os.environ.get(variable, "").strip().lower()
+        if value:
+            return value
+    return ""
+
+
 def _npu_soc_allows_talker_multiframe() -> bool:
     """False on the 910B family, whose rejection verifier cannot take K rows.
 
-    The device-name string decides -- a 910B3 reports "Ascend910B3", the
-    K-step target reports "Ascend910_93" (torch_npu utils list both). The
-    probe runs from the deploy-config loader, before any worker exists, so a
-    failure leaves the gate permissive; the model-side gate in
-    minicpmo_4_5_omni_tts.py is the second line of defence.
+    Judged from the environment only, so loading a deploy config never
+    initialises a device. An unidentifiable SoC is treated as "not allowed":
+    the cost of leaving the frame loop off is a slower run, while speccing a
+    910B faults its rejection kernel. Setting ``VLLM_OMNI_MINICPMO_TALKER_FRAMES``
+    explicitly overrides this (see the caller).
     """
-    name = ""
-    try:
-        import torch_npu
-
-        try:
-            name = str(torch_npu.npu.get_device_name(torch_npu.npu.current_device()))
-        except Exception:
-            name = str(torch_npu.npu.get_device_name(0))
-    except Exception:
-        return True
-    return not name.startswith("Ascend910B")
+    name = _soc_name_from_env()
+    if not name:
+        logger.info(
+            "[minicpmo] SoC not identified from %s; leaving the Talker "
+            "multi-frame loop off. Set %s to force it on.",
+            "/".join(_SOC_ENV_VARS),
+            _MINICPMO_TALKER_FRAMES_ENV,
+        )
+        return False
+    return not name.startswith("ascend910b")
 
 
 def talker_frames_per_step() -> int:
@@ -886,11 +904,21 @@ def _apply_minicpmo_talker_multiframe_default(deploy: "DeployConfig") -> None:
     frames = talker_frames_per_step()
     if frames <= 1:
         return
-    if not _npu_soc_allows_talker_multiframe():
+    explicit = os.environ.get(_MINICPMO_TALKER_FRAMES_ENV, "").strip() != ""
+    if explicit:
+        # An explicit request is an operator decision: arm it and let the
+        # model-side gate make the final call on the live device.
         logger.info(
-            "[minicpmo] Talker multi-frame decode left off: this SoC cannot "
-            "verify spec-width rows (910B family limit). Deploy on 910C/A3, or "
-            "keep the 910B baseline as-is.",
+            "[minicpmo] %s is set explicitly; arming K=%d without the SoC check",
+            _MINICPMO_TALKER_FRAMES_ENV,
+            frames,
+        )
+    elif not _npu_soc_allows_talker_multiframe():
+        logger.info(
+            "[minicpmo] Talker multi-frame decode left off: the SoC either "
+            "cannot verify spec-width rows (910B family limit) or was not "
+            "identified. Deploy on 910C/A3, or set %s explicitly to force it.",
+            _MINICPMO_TALKER_FRAMES_ENV,
         )
         return
     for stage in deploy.stages:
