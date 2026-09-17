@@ -31,6 +31,7 @@ from vllm.model_executor.models.interfaces import SupportsPP
 from vllm.model_executor.models.llama import LlamaModel
 from vllm.model_executor.models.utils import maybe_prefix
 from vllm.v1.sample.sampler import Sampler
+from vllm.v1.outputs import SamplerOutput
 
 from vllm_omni.engine.duplex.intermediate import get_tts_handoff
 from vllm_omni.model_executor.models.minicpmo_4_5 import MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK
@@ -1616,28 +1617,26 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
     def compute_logits(self, hidden_states, *args, **kwargs):
         if not isinstance(hidden_states, torch.Tensor):
             return None
+        if self._k_step_frames > 0:
+            # K-step: the codec stream was already sampled in-model, one frame
+            # per replay, so this head carries no codec information at all.
+            # All it decides is stop/continue per scheduled position, over a
+            # two-id vocabulary -- continue (0) and stop (1) -- which is what
+            # the stage's ``stop_token_ids: [1]`` names. merge_frame_outputs
+            # publishes this step's rows in logits_indices order; a step with
+            # none gets zeros, whose argmax is 0 and therefore "continue".
+            if self._batch_stop_logits is None:
+                return torch.zeros(
+                    hidden_states.shape[0],
+                    2,
+                    device=hidden_states.device,
+                    dtype=torch.float32,
+                )
+            logits = self._batch_stop_logits
+            self._batch_stop_logits = None
+            return logits
         if hidden_states.numel() == 0:
             return hidden_states.new_empty((0, int(self._num_audio_tokens)))
-        # K-step: the codec stream was already sampled in-model, per frame.
-        # This head now only decides stop/continue per scheduled token so the
-        # rejection sampler can verify the constant `continue` drafts: stop
-        # rows argmax to the codec EOS (a stage stop_token_ids entry), the
-        # rest to token id 0. One-hot rows are invariant under the sampler's
-        # temperature/top-k/top-p passes, so nothing else in the vLLM chain
-        # can perturb the decision.
-        if self._k_step_frames > 0 and self._k_stop_row_per_token is not None:
-            stops = self._k_stop_row_per_token
-            self._k_stop_row_per_token = None
-            if len(stops) == hidden_states.shape[0]:
-                vocab = int(self._num_audio_tokens)
-                eos_id = int(self._codec_eos_id)
-                logits = hidden_states.new_full(
-                    (hidden_states.shape[0], vocab), float("-inf")
-                )
-                stop_mask = torch.tensor(stops, dtype=torch.bool, device=logits.device)
-                logits[~stop_mask, 0] = 0.0
-                logits[stop_mask, eos_id] = 0.0
-                return logits
         logits = self.head_code[0](hidden_states).float()
         force_eos = self._force_eos_rows
         mask_eos = self._mask_eos_rows
@@ -1665,13 +1664,23 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         return logits
 
     def sample(self, logits, sampling_metadata):
-        # K-step: the rows reaching here are the one-hot stop/continue heads
-        # compute_logits built. The codec penalty/top-k warps target the codec
-        # stream (already sampled in-model) and would only risk bending the
-        # one-hot -- run the plain sampler.
-        if self._k_step_frames > 0:
+        # Two-column rows are the K-step stop/continue heads compute_logits
+        # built: they are one-hot, so a full sampler pass is ~10 host-dispatched
+        # kernels for a deterministic pick while argmax is bit-identical on
+        # them. int32 matches what the runner's async path scatters into its
+        # input buffers. Anything else (the non-K-step codec head) takes the
+        # ordinary path below, untouched.
+        if (
+            isinstance(logits, torch.Tensor)
+            and logits.ndim == 2
+            and logits.shape[-1] == 2
+            and not getattr(sampling_metadata, "max_num_logprobs", None)
+        ):
             with _prof_span("tts_sampler"):
-                return Sampler()(logits, sampling_metadata)
+                return SamplerOutput(
+                    sampled_token_ids=logits.argmax(dim=-1, keepdim=True).to(torch.int32),
+                    logprobs_tensors=None,
+                )
         prompt_ids = getattr(sampling_metadata, "prompt_token_ids", None)
         if isinstance(logits, torch.Tensor) and isinstance(prompt_ids, torch.Tensor):
             # Copy rather than mutate: the runner may hand us the input batch's
