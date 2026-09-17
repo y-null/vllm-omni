@@ -411,9 +411,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         config: MiniCPMOConfig = vllm_config.model_config.hf_config
         self.config = config
         self.vllm_config = vllm_config
-        self._force_eos_rows: list[bool] | None = None
-        self._mask_eos_rows: list[bool] | None = None
-        self._pending_force_eos_rows: list[bool] | None = None
         self._penalty_histories: list[torch.Tensor] | None = None
         self._request_audio_states: dict[str, dict[str, Any]] = {}
         # Mirrors upstream TTSStreamingGenerator._chunk_info: one committed
@@ -471,7 +468,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         # Last frame's stop/continue rows and the flattened per-token stop
         # sequence the merged step presents to compute_logits.
         self._k_last_stop_rows: list[bool] | None = None
-        self._k_stop_row_per_token: list[bool] | None = None
 
         self.has_preprocess = True
         self.has_postprocess = False
@@ -1637,31 +1633,9 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             return logits
         if hidden_states.numel() == 0:
             return hidden_states.new_empty((0, int(self._num_audio_tokens)))
-        logits = self.head_code[0](hidden_states).float()
-        force_eos = self._force_eos_rows
-        mask_eos = self._mask_eos_rows
-        self._force_eos_rows = None
-        self._mask_eos_rows = None
-        need_force = bool(force_eos and len(force_eos) == logits.shape[0] and any(force_eos))
-        need_mask = bool(mask_eos and len(mask_eos) == logits.shape[0] and any(mask_eos))
-        # sample() re-applies the decision on the sampled ids: vLLM's
-        # MinTokensLogitsProcessor runs after this and would blank the codec EOS
-        # we just forced (it is in the stage's ``stop_token_ids``), leaving an
-        # all -inf row and a request that never releases.
-        self._pending_force_eos_rows = force_eos if need_force else None
-        if need_force or need_mask:
-            logits = logits.clone()
-            eos_id = int(self._codec_eos_id)
-            if need_force:
-                assert force_eos is not None
-                forced = torch.tensor(force_eos, dtype=torch.bool, device=logits.device)
-                logits[forced] = float("-inf")
-                logits[forced, eos_id] = 0.0
-            if need_mask:
-                assert mask_eos is not None
-                masked = torch.tensor(mask_eos, dtype=torch.bool, device=logits.device)
-                logits[masked, eos_id] = float("-inf")
-        return logits
+        # Non-K-step: the real codec head. vLLM samples the codec stream here,
+        # and the stage's stop_token_ids ends the request when it produces it.
+        return self.head_code[0](hidden_states).float()
 
     def sample(self, logits, sampling_metadata):
         # Two-column rows are the K-step stop/continue heads compute_logits
@@ -1691,14 +1665,11 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             )
         with _prof_span("tts_penalty"):
             logits, sampling_metadata = self._apply_codec_repetition_penalty(logits, sampling_metadata)
-        force_eos = self._pending_force_eos_rows
-        self._pending_force_eos_rows = None
         prewarped = _maybe_prewarp_top_k_top_p(logits, sampling_metadata)
         if prewarped is not None:
             logits, sampling_metadata = prewarped
         with _prof_span("tts_sampler"):
-            output = Sampler()(logits, sampling_metadata)
-        return self._force_eos_on_sampled_ids(output, force_eos)
+            return Sampler()(logits, sampling_metadata)
 
     def _apply_codec_repetition_penalty(self, logits, sampling_metadata):
         """Score MiniCPMTTS.generate's windowed codec penalty, not vLLM's.
@@ -1752,24 +1723,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         )
         # Neutralize the sampler's own pass so the penalty is scored once.
         return logits, replace(sampling_metadata, repetition_penalties=torch.ones_like(penalties))
-
-    def _force_eos_on_sampled_ids(self, output: Any, force_eos: list[bool] | None) -> Any:
-        """Overwrite sampled ids for rows the model terminated this step.
-
-        The codec EOS is a stage ``stop_token_ids`` entry, so vLLM's
-        ``min_tokens`` processor masks it for the first ``min_tokens`` steps.
-        A row the model forced to EOS therefore reaches the sampler as all
-        -inf and comes back as an arbitrary codec id, which keeps an
-        already-finished request decoding until its length cap.
-        """
-        if not force_eos or not any(force_eos):
-            return output
-        sampled = getattr(output, "sampled_token_ids", None)
-        if not isinstance(sampled, torch.Tensor) or sampled.shape[0] != len(force_eos):
-            return output
-        rows = torch.tensor(force_eos, dtype=torch.bool, device=sampled.device)
-        sampled[rows] = int(self._codec_eos_id)
-        return output
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         return self._load_native_weights(weights)

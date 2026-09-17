@@ -143,30 +143,11 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         self._init_duplex_sampling_state()
         # Perf N5/T6: steady-state decode input reuse (see decode_prep_fast).
         self._decode_input_cache = decode_prep_fast.DecodeInputCache()
-        # K-step: read the arm state off the model as soon as it exists so
-        # every later path (graph capture included) sees num_spec_tokens.
-        self._arm_k_step()
         #  -------------------------------------- Omni-new -------------------------------------------------
-
-    def _arm_k_step(self) -> int:
-        """Mirror the model's K-step arm onto this runner.
-
-        vLLM V1 grows a request's per-step token allocation only through the
-        speculative path, so the K-frame decode borrows it: num_spec_tokens
-        K-1 makes the scheduler reserve K query positions per request, which
-        the multi-frame loop then replays sequentially (nothing is actually
-        speculative -- the drafts are the constant `continue` id and the
-        frames are generated, not verified, through it).
-        """
-        frames = int(getattr(getattr(self, "model", None), "_k_step_frames", 0) or 0)
-        if frames > 1:
-            self.num_spec_tokens = frames - 1
-        return frames
 
     def load_model(self, *args, **kwargs) -> None:
         super().load_model(*args, **kwargs)
         self._resolve_duplex_sampling_hook(force=True)
-        self._arm_k_step()
 
     @contextlib.contextmanager
     def _narrow_decode_query_len(self):
@@ -334,9 +315,8 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
 
     #  -------------------------------------- Omni-new -------------------------------------------------
     def capture_model(self) -> int:
-        # K-step must arm before capture: the narrow fixed-KV graph only
-        # registers when the runner already reports num_spec_tokens.
-        self._arm_k_step()
+        # num_spec_tokens comes from the deploy config's speculative_config,
+        # which vLLM applies when the runner is built.
         npugraph_memory_bytes = super().capture_model()
         self._capture_talker_mtp_graphs()
         return npugraph_memory_bytes
