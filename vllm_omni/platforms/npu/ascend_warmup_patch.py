@@ -27,9 +27,13 @@ Skipping is safe by construction: the warmup only pre-compiles Triton kernels
 through this dummy construction. The cost is a one-off compile on the first
 penalised sample of the first request. Correctness is unaffected.
 
-Scoped so the 910B baseline keeps the stock warmup byte-for-byte. Probes that
-cannot name the SoC skip the faulting warmup as well: a missing warmup costs
-latency, a faulting one costs the whole run.
+Scoped so the 910B baseline keeps the stock warmup byte-for-byte: the guards
+delegate to the original warmup there. The skip set is resolved when a warmup
+actually runs rather than when the platform is constructed, because the
+constructor can run before the device is set -- and a probe that failed there
+would silently strip a warmup the baseline relies on. A probe that still
+cannot name the SoC skips the faulting warmup: a missing warmup costs latency,
+a faulting one costs the whole run.
 ``VLLM_OMNI_NPU_SKIP_WARMUPS`` overrides the set (comma separated substrings
 of the warmup names, or "none" to restore stock behaviour).
 """
@@ -82,27 +86,34 @@ def _skipped_names() -> set[str]:
     return set(_DEFAULT_SKIP)
 
 
-def _make_no_op(name: str) -> Callable[[Any], None]:
-    def _skip(worker: Any) -> None:  # noqa: ARG001 - signature must match
-        logger.info(
-            "[npu] %s skipped: the legacy BroadcastTo kernel faults the "
-            "910_93 vector core during its dummy-token setup",
-            name,
-        )
+def _make_guard(name: str, original: Callable[[Any], Any]) -> Callable[[Any], Any]:
+    """Run the real warmup unless this call is on a host that must skip it.
 
-    return _skip
+    The decision is taken per call, not at install time: the platform
+    constructor can run before the device is set, and a probe that fails there
+    would otherwise silently skip a warmup the 910B baseline relies on.
+    """
+
+    def _guarded(worker: Any) -> Any:
+        if any(fragment in name for fragment in _skipped_names()):
+            logger.info(
+                "[npu] %s skipped: the legacy BroadcastTo kernel faults the "
+                "910_93 vector core during its dummy-token setup",
+                name,
+            )
+            return None
+        return original(worker)
+
+    _guarded._vllm_omni_guarded = True  # type: ignore[attr-defined]
+    return _guarded
 
 
 def apply_ascend_warmup_patch() -> None:
-    """Replace the warmups selected by ``VLLM_OMNI_NPU_SKIP_WARMUPS``."""
+    """Guard the ascend warmups so a faulting one can be skipped per call."""
     global _PATCHED
     if _PATCHED:
         return
     _PATCHED = True
-
-    skipped = _skipped_names()
-    if not skipped:
-        return
 
     try:
         from vllm_ascend.model_executor.warmup import kernel_warmup as warmup_module
@@ -110,19 +121,18 @@ def apply_ascend_warmup_patch() -> None:
         logger.warning("[npu] Ascend warmup patch not applied: %s", error)
         return
 
-    applied: list[str] = []
+    guarded: list[str] = []
     for name in _WARMUP_NAMES:
-        if not any(fragment in name for fragment in skipped):
+        original = getattr(warmup_module, name, None)
+        if original is None or getattr(original, "_vllm_omni_guarded", False):
             continue
-        if not hasattr(warmup_module, name):
-            continue
-        setattr(warmup_module, name, _make_no_op(name))
-        applied.append(name)
+        setattr(warmup_module, name, _make_guard(name, original))
+        guarded.append(name)
 
-    if applied:
+    if guarded:
         logger.info(
-            "[npu] skipped ascend Triton warmups on this SoC: %s "
-            "(restore with %s=none)",
-            ", ".join(applied),
+            "[npu] ascend Triton warmups guarded (%s); the skip set is resolved "
+            "per call, so the SoC probe sees a live device. Override with %s.",
+            ", ".join(guarded),
             _ENV,
         )
