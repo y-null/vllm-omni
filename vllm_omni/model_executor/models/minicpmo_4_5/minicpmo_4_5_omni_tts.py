@@ -379,24 +379,45 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self._init_native_talker(prefix)
 
     @staticmethod
-    def _soc_allows_k_step() -> bool:
-        """False on SoCs whose rejection kernel cannot take spec-width rows.
+    def _probe_soc_name() -> str:
+        """torch_npu device-name string, or "" when the probe cannot run.
 
-        910B3: rejection_random_sample_kernel hits a vector-core limit once
-        the verifier runs K tokens per request (six rounds of entry_21
-        attempts died there). 910C / A3 (ascend910_93) is the proven target.
-        When the SoC cannot be probed the gate stays permissive -- the env is
-        a deployment decision and the probe is a guardrail, not the switch.
+        The integer SoCVersion encoding is not a documented ordering (a local
+        910B3 reports 223, which defeats any threshold guess), so the guard
+        matches on the name prefix instead -- exactly what torch_npu itself
+        does (utils/_module.py lists "Ascend910B" and "Ascend910_93").
         """
         try:
-            import torch_npu  # noqa: F401  (present in the NPU image)
+            import torch_npu
 
-            soc = int(torch_npu.npu.get_soc_version())
-            # vllm-ascend SoC map: 910B family < 100, ascend910_93 (910C/A3)
-            # reports 100 and above.
-            return soc >= 100
+            return str(
+                torch_npu.npu.get_device_name(torch_npu.npu.current_device())
+            )
         except Exception:
-            return True
+            return ""
+
+    @classmethod
+    def _soc_allows_k_step(cls) -> bool:
+        """False on SoCs whose rejection kernel cannot take spec-width rows.
+
+        910B family ("Ascend910B1".."Ascend910B4"): rejection_random_sample_
+        kernel hits a vector-core limit once the verifier runs K tokens per
+        request (six rounds of entry_21 attempts died there). 910C / A3
+        ("Ascend910_93") is the activation target; unknown future SoCs stay
+        permissive -- the env is a deployment decision and the probe is a
+        guardrail, not the switch.
+        """
+        name = cls._probe_soc_name()
+        if name.startswith("Ascend910B"):
+            logger.warning(
+                "[minicpmo] SoC probe: %r is a 910B part -- K-step spec-width "
+                "verify is not supported there (rejection kernel limit).",
+                name,
+            )
+            return False
+        if name:
+            logger.info("[minicpmo] SoC probe: %r", name)
+        return True
 
     @classmethod
     def _parse_k_step_frames(cls) -> int:
@@ -418,7 +439,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         if not cls._soc_allows_k_step():
             logger.warning(
                 "[minicpmo] OMNI_K_STEP=%d ignored: this SoC's rejection kernel "
-                "cannot verify spec-width rows (910B3 limit). Deploy on 910C/A3.",
+                "cannot verify spec-width rows (910B family limit). Deploy on "
+                "910C/A3 (Ascend910_93).",
                 frames,
             )
             return 0

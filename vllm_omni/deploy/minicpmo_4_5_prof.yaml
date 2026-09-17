@@ -22,9 +22,6 @@ connectors:
       connector_get_max_wait: 300
       codec_chunk_frames: 75
       codec_left_context_frames: 3
-      # entry_21 C1: CFM solve steps (2 -> 3 knobs; stage-2 compute is
-      # paid 1:1 in RTF).
-      token2wav_n_timesteps: 3
       # entry_21 C6: emit a five-frame preview first, then amortize
       # Code2Wav fixed cost with large steady chunks (-9.1% RTF).
       initial_codec_chunk_frames: 5
@@ -111,14 +108,27 @@ stages:
     # Talker context is 4096 (tts_config.max_position_embeddings).
     max_model_len: 4096
     devices: "0"
+    # Unconditional (baseline and K-step arms alike): some vLLM builds
+    # resolve unset async scheduling to True, which the VllmConfig
+    # validation then rejects once the ngram speculative shell below is
+    # uncommented. stage0 carries the same line.
+    async_scheduling: false
     output_connectors:
       to_stage_2: connector_of_shared_memory
-    # K-step (910C/A3 only; 910B3's rejection kernel cannot verify
-    # spec-width rows). Uncomment together with OMNI_K_STEP=8 on the serve
-    # env: the speculative shell is what makes vLLM V1 schedule K query
-    # positions per Talker request; the runner's constant `continue` drafts
-    # and the multi-frame loop then generate the K codec frames through
-    # those slots. num_speculative_tokens must be OMNI_K_STEP - 1.
+    # K-step (910C/A3 only; the 910B family's rejection kernel cannot
+    # verify spec-width rows). Uncomment together with OMNI_K_STEP=8 on the
+    # serve env: the speculative shell is what makes vLLM V1 schedule K
+    # query positions per Talker request; the runner's constant `continue`
+    # drafts and the multi-frame loop then generate the K codec frames
+    # through those slots. num_speculative_tokens must be OMNI_K_STEP - 1.
+    #
+    # NOTE: async_scheduling stays false above (unconditional, not part of
+    # this shell). vLLM's VllmConfig validation rejects async scheduling
+    # with the CPU ngram backend ("... only supported with EAGLE/MTP/Draft
+    # Model/NGram GPU/DSpark ...") and some vLLM builds resolve an unset
+    # value to True; stage0 has the same line for the same reason. Keeping
+    # it out of the shell means the K=8 arm and the baseline arm differ by
+    # exactly one variable.
     # speculative_config:
     #   method: ngram
     #   num_speculative_tokens: 7
