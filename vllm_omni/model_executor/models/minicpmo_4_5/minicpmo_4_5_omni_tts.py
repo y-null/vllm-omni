@@ -421,15 +421,26 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
     @classmethod
     def _parse_k_step_frames(cls) -> int:
-        raw = os.environ.get("OMNI_K_STEP", "0").strip().lower()
+        """K codec frames per Talker step, or 0 when the loop must not engage.
+
+        The count comes from ``config.stage_config.talker_frames_per_step`` --
+        the very function the deploy-config loader uses to size the injected
+        speculative_config -- so the runner and the scheduler cannot disagree
+        about K. ``OMNI_K_STEP`` overrides it for experiments (the older flag
+        name, still honoured).
+        """
+        raw = os.environ.get("OMNI_K_STEP", "").strip().lower()
         if raw in ("", "0", "off", "false", "no"):
-            return 0
-        try:
-            frames = int(raw)
-        except ValueError:
-            raise ValueError(
-                f"OMNI_K_STEP must be an integer frame count (>=2), got {raw!r}"
-            ) from None
+            from vllm_omni.config.stage_config import talker_frames_per_step
+
+            frames = talker_frames_per_step()
+        else:
+            try:
+                frames = int(raw)
+            except ValueError:
+                raise ValueError(
+                    f"OMNI_K_STEP must be an integer frame count (>=2), got {raw!r}"
+                ) from None
         if frames < 2:
             # K=1 degenerates to the ordinary one-frame path; treat it as off
             # so the flag never silently half-arms the pipeline.
@@ -438,10 +449,9 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             raise ValueError(f"OMNI_K_STEP is capped at 16, got {frames}")
         if not cls._soc_allows_k_step():
             logger.warning(
-                "[minicpmo] OMNI_K_STEP=%d ignored: this SoC's rejection kernel "
+                "[minicpmo] K-step decode left off: this SoC's rejection kernel "
                 "cannot verify spec-width rows (910B family limit). Deploy on "
                 "910C/A3 (Ascend910_93).",
-                frames,
             )
             return 0
         logger.info("[minicpmo] Talker K-step decode armed: %d codec frames per step", frames)

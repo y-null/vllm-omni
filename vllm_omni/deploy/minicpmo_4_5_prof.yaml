@@ -108,32 +108,26 @@ stages:
     # Talker context is 4096 (tts_config.max_position_embeddings).
     max_model_len: 4096
     devices: "0"
-    # Unconditional (baseline and K-step arms alike): some vLLM builds
-    # resolve unset async scheduling to True, which the VllmConfig
-    # validation then rejects once the ngram speculative shell below is
-    # uncommented. stage0 carries the same line.
-    async_scheduling: false
     output_connectors:
       to_stage_2: connector_of_shared_memory
-    # K-step (910C/A3 only; the 910B family's rejection kernel cannot
-    # verify spec-width rows). Uncomment together with OMNI_K_STEP=8 on the
-    # serve env: the speculative shell is what makes vLLM V1 schedule K
-    # query positions per Talker request; the runner's constant `continue`
-    # drafts and the multi-frame loop then generate the K codec frames
-    # through those slots. num_speculative_tokens must be OMNI_K_STEP - 1.
+    # K-step is injected by code, not configured here. On 910C/A3 the loader
+    # (config/stage_config.py: _apply_minicpmo_talker_multiframe_default) adds
+    # a speculative_config with num_speculative_tokens = K-1 and turns
+    # async_scheduling off, because vLLM refuses async scheduling next to an
+    # n-gram proposer. K defaults to 8; VLLM_OMNI_MINICPMO_TALKER_FRAMES sets
+    # it (1 = off, 16 = the entry_21 maximum). Nothing is injected on the
+    # 910B family, whose rejection verifier cannot take spec-width rows.
     #
-    # NOTE: async_scheduling stays false above (unconditional, not part of
-    # this shell). vLLM's VllmConfig validation rejects async scheduling
-    # with the CPU ngram backend ("... only supported with EAGLE/MTP/Draft
-    # Model/NGram GPU/DSpark ...") and some vLLM builds resolve an unset
-    # value to True; stage0 has the same line for the same reason. Keeping
-    # it out of the shell means the K=8 arm and the baseline arm differ by
-    # exactly one variable.
+    # Writing an explicit speculative_config below is still allowed and wins
+    # over the default -- but then this stage MUST also carry
+    # `async_scheduling: false`, or the orchestrator dies in
+    # VllmConfig validation before any worker spawns.
     # speculative_config:
     #   method: ngram
     #   num_speculative_tokens: 7
     #   prompt_lookup_min: 1
     #   prompt_lookup_max: 1
+    # async_scheduling: false
     #
     # Talker is a single-vocab codec LM. These knobs go to vLLM's Sampler
     # (head_code logits). EOS is tts_config.eos_token_id (num_audio_tokens-1).

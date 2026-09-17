@@ -798,6 +798,125 @@ def _apply_minicpmo_cudagraph_default(deploy: "DeployConfig") -> None:
                     )
 
 
+_MINICPMO_TALKER_FRAMES_ENV = "VLLM_OMNI_MINICPMO_TALKER_FRAMES"
+# K = codec frames one stage-1 execute_model produces. 8 is the conservative
+# starting point on 910C/A3 (entry_21 measures 16 a further -6.9% at a higher
+# TTFP cost, so the ceiling is left reachable through the environment).
+_MINICPMO_TALKER_FRAMES = 8
+# Same TND ceiling as stage 0: at most 16 query positions per sequence.
+_MINICPMO_TALKER_FRAMES_MAX = 16
+_MINICPMO_FRAMES_OFF = ("0", "1", "off", "false", "no")
+
+
+def _npu_soc_allows_talker_multiframe() -> bool:
+    """False on the 910B family, whose rejection verifier cannot take K rows.
+
+    The device-name string decides -- a 910B3 reports "Ascend910B3", the
+    K-step target reports "Ascend910_93" (torch_npu utils list both). The
+    probe runs from the deploy-config loader, before any worker exists, so a
+    failure leaves the gate permissive; the model-side gate in
+    minicpmo_4_5_omni_tts.py is the second line of defence.
+    """
+    name = ""
+    try:
+        import torch_npu
+
+        try:
+            name = str(torch_npu.npu.get_device_name(torch_npu.npu.current_device()))
+        except Exception:
+            name = str(torch_npu.npu.get_device_name(0))
+    except Exception:
+        return True
+    return not name.startswith("Ascend910B")
+
+
+def talker_frames_per_step() -> int:
+    """Codec frames one stage-1 `execute_model` produces. 1 disables it.
+
+    Deliberately read from the environment on every call rather than cached:
+    the stage config and the model runner agree through this one function and
+    are built at different times in different processes.
+    """
+    raw = os.environ.get(_MINICPMO_TALKER_FRAMES_ENV, "").strip().lower()
+    if not raw:
+        return _MINICPMO_TALKER_FRAMES
+    if raw in _MINICPMO_FRAMES_OFF:
+        return 1
+    try:
+        frames = int(raw)
+    except ValueError:
+        logger.warning(
+            "[minicpmo] %s=%r is not an integer; using the code default %d",
+            _MINICPMO_TALKER_FRAMES_ENV,
+            raw,
+            _MINICPMO_TALKER_FRAMES,
+        )
+        return _MINICPMO_TALKER_FRAMES
+    if frames < 1:
+        return 1
+    return min(frames, _MINICPMO_TALKER_FRAMES_MAX)
+
+
+def _apply_minicpmo_talker_multiframe_default(deploy: "DeployConfig") -> None:
+    """Let the Talker produce K codec frames per scheduler step on 910C/A3.
+
+    A stage-1 decode step is dominated by per-*step* host work rather than per
+    frame, so running K frames inside one `execute_model` pays that host cost
+    once (entry_21: ~2.9 ms of host around a 0.83 ms device forward, over ~118
+    frames per request). The frames are *sequential* -- frame k+1 is
+    conditioned on the codec token sampled at frame k -- so this is not
+    speculative decoding and the runner runs its own inner loop. vLLM still
+    has to know the request advanced by K tokens, because that is what grows
+    the block table and KV slots the loop writes into, and `spec_token_ids` is
+    V1's only mechanism for that; hence a speculative_config that carries the
+    count. The n-gram proposer is never consulted: `propose_draft_token_ids`
+    returns the Talker's `continue` token K-1 times, so verification is exact
+    by construction.
+
+    `async_scheduling` comes off with it. vLLM refuses async scheduling next
+    to an n-gram proposer ("only supported with EAGLE/MTP/Draft Model/NGram
+    GPU/DSpark"), which is the same reason stage 0 carries the flag, and a
+    synchronous scheduler costs less here than the K-fold host saving returns.
+
+    Left off entirely on the 910B family: its rejection verifier trips a
+    vector-core limit on spec-width rows, so the baseline there stays exactly
+    as the deploy config describes it.
+    """
+    frames = talker_frames_per_step()
+    if frames <= 1:
+        return
+    if not _npu_soc_allows_talker_multiframe():
+        logger.info(
+            "[minicpmo] Talker multi-frame decode left off: this SoC cannot "
+            "verify spec-width rows (910B family limit). Deploy on 910C/A3, or "
+            "keep the 910B baseline as-is.",
+        )
+        return
+    for stage in deploy.stages:
+        if stage.stage_id != 1:
+            continue
+        if stage.engine_extras.get("speculative_config") is not None:
+            # An explicit config wins; this default only fills a gap.
+            logger.info(
+                "[minicpmo] stage 1 carries an explicit speculative_config; "
+                "leaving it and its async_scheduling flag untouched",
+            )
+            return
+        stage.engine_extras["speculative_config"] = {
+            "method": "ngram",
+            "num_speculative_tokens": frames - 1,
+            "prompt_lookup_min": 1,
+            "prompt_lookup_max": 1,
+        }
+        stage.async_scheduling = False
+        logger.info(
+            "[minicpmo] stage 1 multi-frame decode on (%d codec frames per "
+            "step, synchronous scheduler); set %s=1 to override",
+            frames,
+            _MINICPMO_TALKER_FRAMES_ENV,
+        )
+
+
 def _apply_minicpmo_perf_defaults(deploy: "DeployConfig", config_path: object = None) -> None:
     """Apply MiniCPM-o perf code-defaults, scoped to this deploy config on NPU."""
     if config_path is None or "minicpmo" not in str(config_path).lower():
@@ -811,6 +930,7 @@ def _apply_minicpmo_perf_defaults(deploy: "DeployConfig", config_path: object = 
     if (device_name or "").lower() != "npu":
         return
     _apply_minicpmo_cudagraph_default(deploy)
+    _apply_minicpmo_talker_multiframe_default(deploy)
 
 
 def load_deploy_config(path: str | Path) -> DeployConfig:
