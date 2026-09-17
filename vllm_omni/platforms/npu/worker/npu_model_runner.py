@@ -476,6 +476,57 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
         }
         run_model = partial(self.model, **model_inputs)
 
+        # K-step (Talker multi-frame decode). A decode step that schedules K
+        # positions per request belongs to ``talker_multiframe``: it replays the
+        # captured decode graph K times -- refreshing the graph's parameters
+        # before every replay, which is what keeps positions and embeddings in
+        # step with the frame being produced -- and samples one codec frame per
+        # replay. Everything else (prefill, a mixed step, another stage) falls
+        # through to the ordinary single-forward path below.
+        from vllm_omni.platforms.npu.worker import talker_multiframe
+
+        frames = talker_multiframe.applies(self.model, model_kwargs_extra)
+        if frames <= 1 and talker_multiframe.is_multi_token_decode(self.model, model_kwargs_extra):
+            # Falling through here would sample one frame from the last row of
+            # each span and report one stop row for a step that needs one per
+            # position: wrong codec tokens and wrong scheduler accounting, both
+            # silently. The preceding gate log says which check refused.
+            raise RuntimeError(
+                "MiniCPM-o scheduled a multi-token decode step that the multi-frame "
+                "loop declined; see the preceding '[minicpmo] multi-frame Talker "
+                "decode not engaged' line"
+            )
+        if frames > 1:
+            spans = [(int(start), int(end)) for start, end in model_kwargs_extra["request_token_spans"]]
+            model_kwargs_extra["omni_k_sampling"] = self._k_step_sampling_knobs(len(spans))
+            narrow = talker_multiframe.begin_narrow_step(
+                runner=self,
+                forward_context=forward_context,
+                frames=frames,
+                positions=positions,
+                inputs_embeds=inputs_embeds,
+                spans=spans,
+            )
+            graph_tokens = len(spans) if narrow is not None else num_tokens_padded
+            try:
+                model_output = talker_multiframe.run(
+                    model=self.model,
+                    run_model=run_model,
+                    after_forward=lambda: self._update_full_graph_params_if_needed(
+                        forward_context, graph_tokens
+                    ),
+                    inputs_embeds=inputs_embeds,
+                    input_ids=input_ids,
+                    frames=frames,
+                    model_kwargs=model_kwargs,
+                    model_kwargs_extra=model_kwargs_extra,
+                    narrow=narrow,
+                )
+            finally:
+                talker_multiframe.end_narrow_step(forward_context, narrow)
+            self._omni_last_model_output = model_output
+            return model_output
+
         if self.enable_enpu:
             # The soft segmentation scenario requires event.record first, then event.wait.
             self._update_full_graph_params_if_needed(forward_context, num_tokens_padded)
