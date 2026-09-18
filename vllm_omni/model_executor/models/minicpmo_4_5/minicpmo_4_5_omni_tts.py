@@ -314,6 +314,87 @@ def resolve_codec_sampling_params(
 
 
 
+# ---------------------------------------------------------------------------
+# K 步逐帧诊断（默认关，与 talker_multiframe 的逐步计时互补）
+#
+#   VLLM_OMNI_MINICPMO_KSTEP_FRAME_TRACE=1   打开
+#   最多打 _KSTEP_FRAME_TRACE_FRAMES 帧，然后静默
+#
+# 回答逐步计时回答不了的那个问题：K 循环里**模型自己的采样器**有没有走到 EOS，
+# 以及每一帧实际吃进去的 code 是不是上一帧的采样值（契约不变式 I1）。
+# 契约：诊断永不许反杀引擎 —— 任何异常只把本诊断永久关掉并记一条 warning。
+# ---------------------------------------------------------------------------
+_KSTEP_FRAME_TRACE_ENV = "VLLM_OMNI_MINICPMO_KSTEP_FRAME_TRACE"
+_KSTEP_FRAME_TRACE_LINES = 128   # 打点行数上限
+_KSTEP_FRAME_TRACE_HEAD = 16     # 头 N 帧逐帧（用于校验帧序不变式 I1）
+_KSTEP_FRAME_TRACE_STRIDE = 16   # 之后每 N 帧一条（覆盖到约第 1800 帧，够看 EOS）
+_KSTEP_FRAME_TRACE: dict[str, Any] = {"reqs": {}, "lines": 0, "off": False}
+
+
+def kstep_frame_trace_enabled() -> bool:
+    """Off unless the env turns it on; latched off for good after a failure."""
+    if _KSTEP_FRAME_TRACE["off"]:
+        return False
+    raw = os.environ.get(_KSTEP_FRAME_TRACE_ENV, "").strip().lower()
+    return bool(raw) and raw not in ("0", "false", "no", "off")
+
+
+def _trace_kstep_frame(model: Any, **fields: Any) -> None:
+    """One line per codec frame while the multi-frame loop owns sampling.
+
+    Logs what the *model* decided: the code each frame took as its input (the
+    previous frame's sample, per the contract), what it sampled, whether that
+    was the codec EOS, and where the sampler's own step counter stood. The first
+    ``HEAD`` frames are logged one per line (that is what verifies the frame
+    chain), then one line every ``STRIDE`` frames so the window still covers the
+    frames where EOS first becomes eligible -- `min_tokens` masks it before
+    then, so a head-only trace can never see a stop. An EOS sample is always
+    logged regardless of the stride. Never raises: a failure disables the trace
+    for good.
+    """
+    state = _KSTEP_FRAME_TRACE
+    if state["off"]:
+        return
+    reqs = state["reqs"]
+    request_id = str(fields.get("request_id"))
+    seen = reqs.get(request_id, 0)
+    reqs[request_id] = seen + 1
+    is_eos = bool(fields.get("is_eos"))
+    interesting = seen < _KSTEP_FRAME_TRACE_HEAD or (
+        seen >= _KSTEP_FRAME_TRACE_HEAD and (seen - _KSTEP_FRAME_TRACE_HEAD) % _KSTEP_FRAME_TRACE_STRIDE == 0
+    )
+    if not is_eos and (not interesting or state["lines"] >= _KSTEP_FRAME_TRACE_LINES):
+        return
+    try:
+        device_states = getattr(model, "_request_codec_device_states", None)
+        device_state = (
+            device_states.get(fields.get("request_id")) if isinstance(device_states, dict) else None
+        )
+        device_step = int(device_state.step.reshape(-1)[0].item()) if device_state is not None else -1
+        state["lines"] += 1  # 只防刷屏，窗口按请求单独计数
+        logger.info(
+            "[kstep-frame] frame=%d req=%s step=%s->%s device_step=%s in_code=%s row=%s "
+            "sampled=%s is_eos=%s limit=%s finished=%s ctx=%s min=%s max=%s",
+            seen,
+            str(fields.get("request_id"))[:12],
+            fields.get("step_before"),
+            fields.get("step_after"),
+            device_step,
+            fields.get("prev_code"),
+            fields.get("row"),
+            fields.get("sampled_id"),
+            fields.get("is_eos"),
+            fields.get("reached_limit"),
+            fields.get("finished"),
+            fields.get("ctx_len"),
+            fields.get("min_tokens"),
+            fields.get("max_tokens"),
+        )
+    except Exception as exc:  # pragma: no cover - diagnostics never raise
+        state["off"] = True
+        logger.warning("[kstep-frame] trace disabled after failure: %r", exc)
+
+
 def _codec_int_param(state: Any, key: str, fallback: int) -> int:
     """Read an integer codec knob from a request state, None meaning unset.
 
@@ -1060,11 +1141,28 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                     # stub this method with the sampled tensor itself.
                     sampled = stochastic_result.reshape(()).to(torch.long)
             sampled_id = int(sampled.item())
-            is_eos = sampled_id == self._num_audio_tokens - 1
+            prev_code = state.get("last_code") if isinstance(state, Mapping) else None
+            is_eos = sampled_id == self._codec_eos_id
             state["step"] = _codec_int_param(state, "step", 0) + 1
             reached_limit = int(state["step"]) >= _codec_int_param(state, "max_tokens", self._codec_max_tokens)
             finished = is_eos or reached_limit
             state["finished"] = finished
+            if self._k_step_frames > 0 and kstep_frame_trace_enabled():
+                _trace_kstep_frame(
+                    self,
+                    request_id=request_id,
+                    step_before=step,
+                    step_after=int(state["step"]),
+                    prev_code=prev_code,
+                    row=int(end) - 1,
+                    sampled_id=sampled_id,
+                    is_eos=is_eos,
+                    reached_limit=reached_limit,
+                    finished=finished,
+                    ctx_len=int(codes.numel()) if isinstance(codes, torch.Tensor) else -1,
+                    min_tokens=min_tokens,
+                    max_tokens=max_tokens,
+                )
             # MiniCPMTTS.generate_chunk consumes the boundary sample but
             # returns only codes that were fed into the retained KV state.
             if not is_eos and not reached_limit:
@@ -1228,7 +1326,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             )
             device_inputs_by_request[request_id] = device_inputs
         min_tokens_tensor, temperature_tensor, penalty_tensor = device_inputs
-        eos_id = self._num_audio_tokens - 1
+        eos_id = self._codec_eos_id
         logits = prepare_codec_logits(
             self.head_code[0](hidden_state).float(),
             device_state,
@@ -1305,7 +1403,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             min_tokens_tensor,
             penalty_tensor,
             top_k=self._codec_top_k,
-            eos_token_id=self._num_audio_tokens - 1,
+            eos_token_id=self._codec_eos_id,
         )
         device_states[request_id] = result.state
         # The kernel ABI is int32, while the existing connector/audio-code
@@ -1369,10 +1467,25 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self._deferred_cleanup_ids.update(str(req_id) for req_id in finished_req_ids)
 
     def _flush_deferred_cleanup(self) -> None:
+        """Drop every per-request cache a finished request left behind.
+
+        The sampler's own caches belong here as much as the codec history does:
+        ``_request_codec_device_states`` carries the step counter and the
+        penalty window the EOS mask is derived from, and
+        ``_request_codec_device_inputs`` carries the ``min_tokens`` copied at
+        first use. Leaving them behind means a recycled request id resumes with
+        another request's counters -- the EOS mask then holds or lifts at the
+        wrong frame, and ``_request_generators`` leaks a generator per request
+        on top of that. All three key off the same request id, so they are
+        dropped together with the rest.
+        """
         request_audio_states = getattr(self, "_request_audio_states", {})
         request_condition_states = getattr(self, "_request_condition_states", {})
         penalty_windows = getattr(self, "_penalty_windows_dev", None)
         penalty_freqs = getattr(self, "_penalty_freqs_dev", None)
+        codec_device_states = getattr(self, "_request_codec_device_states", None)
+        codec_device_inputs = getattr(self, "_request_codec_device_inputs", None)
+        request_generators = getattr(self, "_request_generators", None)
         for request_id in self._deferred_cleanup_ids:
             request_audio_states.pop(request_id, None)
             request_condition_states.pop(request_id, None)
@@ -1380,6 +1493,12 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 penalty_windows.pop(request_id, None)
             if isinstance(penalty_freqs, dict):
                 penalty_freqs.pop(request_id, None)
+            if isinstance(codec_device_states, dict):
+                codec_device_states.pop(request_id, None)
+            if isinstance(codec_device_inputs, dict):
+                codec_device_inputs.pop(request_id, None)
+            if isinstance(request_generators, dict):
+                request_generators.pop(request_id, None)
         self._deferred_cleanup_ids.clear()
 
     def _dummy_hidden_states(

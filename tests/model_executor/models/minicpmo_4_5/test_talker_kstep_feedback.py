@@ -241,6 +241,32 @@ def test_guard_keeps_drafts_when_all_decodes_share_the_padded_width(monkeypatch)
     assert first_step.spec_token_ids == []
 
 
+def test_talker_stop_token_ids_follow_the_arming_decision(monkeypatch):
+    """Stage 1's stop id must be one the head that actually runs can emit.
+
+    2026-09-18 root cause: the pipeline constraint pinned ``stop_token_ids`` to
+    the codec EOS (6561) unconditionally. With the K-frame loop armed the
+    vLLM-level head is the two-wide continue/stop row, so the only sampleable
+    ids are 0/1, `check_stop` never matched, and every K-step request ran to
+    ``max_tokens`` (142s per request on 910B, model finished at frame ~116).
+    """
+    from vllm_omni.model_executor.models.minicpmo_4_5 import pipeline as mcp_pipeline
+    from vllm_omni.platforms.npu.worker import talker_multiframe
+
+    monkeypatch.setenv(_TALKER_FRAMES_ENV, "8")
+    assert mcp_pipeline._talker_stop_token_ids() == [talker_multiframe.STOP_TOKEN_ID]
+    assert talker_multiframe.STOP_TOKEN_ID == 1
+
+    monkeypatch.setenv(_TALKER_FRAMES_ENV, "1")
+    assert mcp_pipeline._talker_stop_token_ids() == [6561]
+
+    # No explicit frame count on a 910B box: the loop stays off, so the real
+    # codec head runs and its EOS is the stop.
+    monkeypatch.delenv(_TALKER_FRAMES_ENV, raising=False)
+    monkeypatch.setenv("SOC_VERSION", "ascend910b1")
+    assert mcp_pipeline._talker_stop_token_ids() == [6561]
+
+
 def test_multiframe_gate_matrix():
     from vllm_omni.platforms.npu.worker import talker_multiframe
 
@@ -406,7 +432,15 @@ def test_kstep_bookkeeping_trace_is_total(monkeypatch):
     talker_multiframe.trace_kstep_bookkeeping(runner, [[0, 0, 1]], torch.zeros(2, 2))
     assert talker_multiframe.stop_trace_enabled() is True
 
-    # 最坏输入：诊断必须降级，绝不抛回 decode 步里。
+    # 最坏输入：内部构造真的失败时必须降级（绝不抛回 decode 步里）并永久关掉
+    # 自己，否则每个 step 都要付一次异常代价。`[5]` 让 list(row) 抛 TypeError。
+    monkeypatch.setattr(talker_multiframe, "_STOP_KB_COUNT", 0)
+    talker_multiframe.trace_kstep_bookkeeping(SimpleNamespace(), [5], torch.zeros(2, 2))
+    assert talker_multiframe.stop_trace_enabled() is False
+
+    # 取不到 runner/输入是合法场景的优雅降级，不是失败：不能因此把诊断关掉，
+    # 否则一次空步就会让后面所有取证静默。
+    monkeypatch.setenv(talker_multiframe._STOP_TRACE_ENV, "1")
     monkeypatch.setattr(talker_multiframe, "_STOP_KB_COUNT", 0)
     talker_multiframe.trace_kstep_bookkeeping(None, None, None)
-    assert talker_multiframe.stop_trace_enabled() is False
+    assert talker_multiframe.stop_trace_enabled() is True

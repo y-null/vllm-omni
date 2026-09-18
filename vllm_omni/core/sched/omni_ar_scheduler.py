@@ -30,6 +30,77 @@ from vllm_omni.engine.serialization import deserialize_additional_information
 
 logger = init_logger(__name__)
 
+# ---------------------------------------------------------------------------
+# K 步记账 trace（默认关）
+#
+#   VLLM_OMNI_MINICPMO_KSTEP_ACCOUNT_TRACE=1
+#
+# 回答的问题：模型已经在发 row_stop，为什么请求不停？记每一步每个请求"被接受的
+# token 值"——若它恒为 0（continue），说明 stop 行没有变成请求 token 表里的 1，
+# check_stop(stop_token_ids=[1]) 永远不会触发，请求就会一路走到 max_model_len。
+# 契约：诊断永不抛异常。
+# ---------------------------------------------------------------------------
+_KSTEP_ACCOUNT_TRACE_ENV = "VLLM_OMNI_MINICPMO_KSTEP_ACCOUNT_TRACE"
+_KSTEP_ACCOUNT_TRACE: dict = {"lines": 0, "reqs": {}, "off": False}
+
+
+def kstep_account_trace_enabled() -> bool:
+    """Off unless the env turns it on; latched off for good after a failure."""
+    if _KSTEP_ACCOUNT_TRACE["off"]:
+        return False
+    raw = os.environ.get(_KSTEP_ACCOUNT_TRACE_ENV, "").strip().lower()
+    return bool(raw) and raw not in ("0", "false", "no", "off")
+
+
+def _trace_kstep_account(
+    req_id, spec_len, generated, computed, total, prompt_len, status, sampling=None
+) -> None:
+    """One line per request per step; first 24 steps of each request, then 1 in 16."""
+    state = _KSTEP_ACCOUNT_TRACE
+    if state["off"]:
+        return
+    try:
+        key = str(req_id)
+        seen = state["reqs"].get(key, 0)
+        state["reqs"][key] = seen + 1
+        gen_len = len(generated or [])
+        # Invariant I2/I5: a step with drafts must hand the request
+        # spec_len + 1 tokens (the bonus plus every accepted draft). A short
+        # row means frames the model produced were dropped on the way to the
+        # request -- always log it, whatever the stride.
+        partial = bool(spec_len) and gen_len != spec_len + 1
+        interesting = seen < 24 or seen % 16 == 0 or partial
+        nonzero = [int(t) for t in (generated or []) if int(t) != 0]
+        if not interesting and not nonzero:
+            return
+        if state["lines"] >= 400:
+            return
+        state["lines"] += 1
+        logger.info(
+            "[kstep-acct] req=%s step=%d spec_len=%s gen=%s partial=%s nonzero=%s computed=%s tokens=%s "
+            "prompt=%s status=%s stop_ids=%s eos=%s min=%s max=%s ignore_eos=%s",
+            key[:12],
+            seen,
+            spec_len,
+            gen_len,
+            int(partial),
+            nonzero[:6],
+            computed,
+            total,
+            prompt_len,
+            status,
+            list(getattr(sampling, "stop_token_ids", None) or []),
+            getattr(sampling, "eos_token_id", None),
+            getattr(sampling, "min_tokens", None),
+            getattr(sampling, "max_tokens", None),
+            getattr(sampling, "ignore_eos", None),
+        )
+    except Exception as exc:  # pragma: no cover - diagnostics never raise
+        state["off"] = True
+        logger.warning("[kstep-acct] trace disabled after failure: %r", exc)
+
+
+
 
 class SampledLogprobContractError(RuntimeError):
     """The model runner returned unusable sampled-token logprobs."""
@@ -601,6 +672,17 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 continue
             req_index = model_runner_output.req_id_to_index[req_id]
             generated_token_ids = sampled_token_ids[req_index] if sampled_token_ids else []
+            if kstep_account_trace_enabled():
+                _trace_kstep_account(
+                    req_id,
+                    len(scheduler_output.scheduled_spec_decode_tokens.get(req_id) or []),
+                    generated_token_ids,
+                    int(request.num_computed_tokens),
+                    int(request.num_tokens),
+                    len(getattr(request, "prompt_token_ids", None) or []),
+                    getattr(request, "status", None),
+                    getattr(request, "sampling_params", None),
+                )
 
             stale_async_tokens = int(getattr(request, "async_tokens_to_discard", 0) or 0)
             async_output_is_stale = bool(generated_token_ids and stale_async_tokens > 0)
