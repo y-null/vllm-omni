@@ -75,11 +75,20 @@ def a14_mode() -> str:
     "scalar ... out of bounds") both in the Triton warmup and during the
     one-query graph capture. A sampling speedup does not pay for a crash, and
     ``auto``/``required`` stay available for a payload verified on the target.
+    Boolean spellings are accepted and map onto the nearest mode, because
+    shell profiles keep carrying ``export VLLM_OMNI_A14_MODE=False``.
     """
     configured = os.environ.get(_A14_MODE_ENV)
     if configured is None:
         return "required" if os.environ.get(_A14_EXTENSION_ENV) else "off"
     mode = configured.strip().lower()
+    if mode in {"false", "0", "no"}:
+        return "off"
+    if mode in {"true", "1", "yes", "on"}:
+        # An explicit true wants the operator on, and ``auto`` is the most
+        # permissive legal way to ask for that: it falls back to the eager
+        # chain wherever the payload does not load.
+        return "auto"
     if mode not in {"auto", "off", "required"}:
         raise RuntimeError(f"{_A14_MODE_ENV} must be 'auto', 'off' or 'required', got {configured!r}")
     return mode
