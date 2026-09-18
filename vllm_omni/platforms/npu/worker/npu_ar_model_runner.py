@@ -233,31 +233,6 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         decode_prep_fast.note_generic(self, scheduler_output, num_scheduled_tokens, result)
         return result
 
-    def _k_step_sampling_knobs(self, num_reqs: int) -> list[dict]:
-        """Per-request sampling knobs for the in-model codec sampler.
-
-        The K-frame loop cannot run the vLLM host sampler per frame, so the
-        runner hands the model each request's generation params (penalty /
-        temperature) up front; anything missing falls back to the model's
-        generate()-time defaults.
-        """
-        knobs: list[dict] = []
-        try:
-            params = self.input_batch.sampling_params
-            for index in range(num_reqs):
-                p = params[index] if index < len(params) else None
-                knobs.append(
-                    {
-                        "penalty": float(getattr(p, "repetition_penalty", 1.0) or 1.0),
-                        "temperature": float(getattr(p, "temperature", 1.0) or 1.0),
-                        "top_k": int(getattr(p, "top_k", 0) or 0),
-                        "top_p": float(getattr(p, "top_p", 1.0) or 1.0),
-                    }
-                )
-        except Exception:
-            knobs = []
-        return knobs
-
     def propose_draft_token_ids(self, valid_sampled_token_ids, *args, **kwargs):
         """Carry the Talker's frame count to the scheduler, not a prediction.
 
