@@ -367,7 +367,11 @@ def neutralize_kstep_min_tokens(logitsprocs: Any) -> None:
     """
     try:
         for proc in getattr(logitsprocs, "non_argmax_invariant", None) or []:
-            if type(proc).__name__ != "MinTokensLogitsProcessor":
+            if not type(proc).__name__.endswith("MinTokensLogitsProcessor"):
+                # Suffix rather than equality: the processor can arrive
+                # subclassed or wrapped (a platform patch, a profiling shim),
+                # and a mismatch here is silent -- the mask stays on and the
+                # only stop signal a K-step request has is censored forever.
                 continue
             min_toks = getattr(proc, "min_toks", None)
             if isinstance(min_toks, dict) and min_toks:
@@ -836,6 +840,12 @@ def _write_frame_embeddings(
 # argmax, so 0 means "keep going" and 1 is the stop token the deploy config
 # names in `stop_token_ids`.
 CONTINUE_TOKEN_ID = 0
+
+# The id that same row emits to mean stop: the stop column wins the argmax,
+# `parse_output` keeps ids below the two-wide vocab, and vLLM's `check_stop`
+# only fires if this id is in the request's `stop_token_ids` -- which stage 1's
+# pipeline constraints derive from this constant.
+STOP_TOKEN_ID = 1
 
 # Width of the Talker vLLM-level head: the two-wide continue/stop row.
 # input_batch.vocab_size must report the same, because InputBatch stores

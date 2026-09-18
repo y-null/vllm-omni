@@ -876,6 +876,30 @@ def talker_frames_per_step() -> int:
     return min(frames, _MINICPMO_TALKER_FRAMES_MAX)
 
 
+def talker_multiframe_armed() -> bool:
+    """Whether the Talker K-frame loop will run in this process.
+
+    One source of truth for the three places that must agree: the deploy-config
+    injection below (does stage 1 get the speculative_config), the model's own
+    gate, and stage 1's stop-token constraint. The last one is not obvious: when
+    the loop is armed the vLLM-level head collapses to the two-wide
+    continue/stop row (``compute_logits``), so the only ids that can be sampled
+    are 0 and 1 and the codec EOS becomes unreachable *at that level*. A
+    ``stop_token_ids`` the head can never emit means `check_stop` never fires
+    and the request runs to ``max_tokens`` -- the loop keeps paying for a
+    request that already finished at the codec level.
+
+    An explicit ``VLLM_OMNI_MINICPMO_TALKER_FRAMES`` is an operator decision and
+    arms regardless of the SoC, exactly as the loader below does. Everything
+    else is the SoC gate's answer, and an unidentified SoC counts as "no".
+    """
+    if talker_frames_per_step() <= 1:
+        return False
+    if os.environ.get(_MINICPMO_TALKER_FRAMES_ENV, "").strip():
+        return True
+    return _npu_soc_allows_talker_multiframe()
+
+
 def _apply_minicpmo_talker_multiframe_default(deploy: "DeployConfig") -> None:
     """Let the Talker produce K codec frames per scheduler step on 910C/A3.
 
@@ -905,6 +929,14 @@ def _apply_minicpmo_talker_multiframe_default(deploy: "DeployConfig") -> None:
     if frames <= 1:
         return
     explicit = os.environ.get(_MINICPMO_TALKER_FRAMES_ENV, "").strip() != ""
+    if not talker_multiframe_armed():
+        logger.info(
+            "[minicpmo] Talker multi-frame decode left off: the SoC either "
+            "cannot verify spec-width rows (910B family limit) or was not "
+            "identified. Deploy on 910C/A3, or set %s explicitly to force it.",
+            _MINICPMO_TALKER_FRAMES_ENV,
+        )
+        return
     if explicit:
         # An explicit request is an operator decision: arm it and let the
         # model-side gate make the final call on the live device.
@@ -913,14 +945,6 @@ def _apply_minicpmo_talker_multiframe_default(deploy: "DeployConfig") -> None:
             _MINICPMO_TALKER_FRAMES_ENV,
             frames,
         )
-    elif not _npu_soc_allows_talker_multiframe():
-        logger.info(
-            "[minicpmo] Talker multi-frame decode left off: the SoC either "
-            "cannot verify spec-width rows (910B family limit) or was not "
-            "identified. Deploy on 910C/A3, or set %s explicitly to force it.",
-            _MINICPMO_TALKER_FRAMES_ENV,
-        )
-        return
     for stage in deploy.stages:
         if stage.stage_id != 1:
             continue
