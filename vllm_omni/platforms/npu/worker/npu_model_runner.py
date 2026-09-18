@@ -538,8 +538,15 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
             # and the next steps schedule a negative count -- the engine hangs
             # right after the first 'engaged' step. Single-frame steps never
             # took the branch that reads vocab_size; only the K-step does.
+            # The gate needs one thing from this call: that this really is a
+            # multi-frame decode step. The width it writes is the two-wide stop
+            # row, never the hidden width this tensor happens to carry. Hand it
+            # the stop rows when they are at hand so the intent is visible, and
+            # keep the hidden states only as the "this is a K-step" signal.
+            stop_rows = getattr(self.model, "_batch_stop_logits", None)
             talker_multiframe.ensure_stop_token_vocab(
-                self, model_output.text_hidden_states
+                self,
+                stop_rows if stop_rows is not None else model_output.text_hidden_states,
             )
             self._omni_last_model_output = model_output
             return model_output

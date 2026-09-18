@@ -255,6 +255,48 @@ def _prof_step_end(prof: "_StepProf | None", step_start: float) -> None:
             _prof_summary(_PROF_STEPS, _PROF_FRAMES, prof.frames, detail=prof.detail)
     except Exception:
         _prof_disabled("step_end")
+# ---------------------------------------------------------------------------
+# K 步 stop 取证（默认关）
+#
+#   VLLM_OMNI_MINICPMO_KSTEP_STOP_TRACE=1
+#
+# 只回答一个问题：一步 K 帧里，模型到底有没有产出 stop 行。有 stop 行而请求
+# 仍跑到 max_tokens，丢在 vLLM 的 spec 记账侧；一行都没有，丢在多帧的采样/状态
+# 传递侧。前 50 步各打一行，之后静默。诊断组件永不抛异常。
+# ---------------------------------------------------------------------------
+_STOP_TRACE_ENV = "VLLM_OMNI_MINICPMO_KSTEP_STOP_TRACE"
+_STOP_TRACE_STEPS = 50
+_STOP_TRACE_COUNT = 0
+
+
+def stop_trace_enabled() -> bool:
+    """Off unless the env explicitly turns it on (``1``/``true``/``yes``/``on``)."""
+    try:
+        raw = os.environ.get(_STOP_TRACE_ENV, "").strip().lower()
+        return bool(raw) and raw not in _PROF_OFF
+    except Exception:  # pragma: no cover - env is a dict lookup, but be total
+        return False
+
+
+def _trace_stop_rows(frame_stop_logits: list[torch.Tensor]) -> None:
+    """每步一行：每个请求的 K 帧里各有几帧的 stop 行是 stop。"""
+    global _STOP_TRACE_COUNT
+    try:
+        if _STOP_TRACE_COUNT >= _STOP_TRACE_STEPS:
+            return
+        _STOP_TRACE_COUNT += 1
+        flags = torch.stack([row.argmax(dim=-1) for row in frame_stop_logits], dim=1)
+        logger.info(
+            "[kstep-stop] step=%d frames=%d stops_per_req=%s",
+            _STOP_TRACE_COUNT,
+            len(frame_stop_logits),
+            flags.sum(dim=1).cpu().tolist(),
+        )
+    except Exception as exc:
+        logger.warning("[kstep-stop] trace disabled after failure: %r", exc)
+        os.environ[_STOP_TRACE_ENV] = "0"
+
+
 _LOGGED_BLOCK: str | None = None
 _LOGGED_NARROW = False
 _LOGGED_NARROW_BLOCK: str | None = None
@@ -355,7 +397,13 @@ def applies(model: Any, model_kwargs_extra: dict[str, Any]) -> int:
         if int(end) - int(start) != frames:
             # A mixed step (one request prefilling, another decoding) has no
             # single frame count, and the captured graph is not a uniform
-            # decode either.
+            # decode either. Dump the spans so a real-world refusal can be
+            # attributed to an exact scheduling state instead of guessed at.
+            logger.info(
+                "[minicpmo] refusing non-uniform spans: frames=%d spans=%s",
+                frames,
+                [(int(s), int(e)) for s, e in spans],
+            )
             return _block("request token spans are not uniform")
     for info in infos:
         if not isinstance(info, dict):
@@ -646,6 +694,8 @@ def run(
         logger.info(
             "[minicpmo] multi-frame Talker decode engaged: %d codec frames per step", frames
         )
+    if stop_trace_enabled():
+        _trace_stop_rows(frame_stop_logits)
     merged = model.merge_frame_outputs(frame_outputs, frame_stop_logits)
     if narrow is not None and frame_hidden:
         # (frames, rows, hidden) -> (rows * frames, hidden), request-major --
@@ -773,23 +823,33 @@ def ensure_stop_token_vocab(runner: Any, logits: Any) -> None:
     which `_bookkeeping_sync` takes down the `max_gen_len == 1` branch, and that
     branch does not consult `vocab_size` at all.
 
-    Raising it to the width of the row the model actually emits is the whole
-    fix, and it cannot narrow anything: every other reader of `vocab_size`
-    compares against it as an upper bound. The one that repays checking is
-    `InputBatch.add_request`, which stores `top_k = vocab_size` as its "no
-    top-k" sentinel -- 0 and 2 are both sentinels here, `top_k_reqs` stays
-    empty either way, and `sampling_metadata.top_k` stays None, so the Ascend
-    `enable_reduce_sample` branch that would index `top_k_cpu` never runs.
+    Raising it back to the width of the row the model actually emits is the
+    whole fix -- and that width is `STOP_ROW_WIDTH` (two), *not* the width of
+    whatever tensor the caller happens to be holding. The Talker's vLLM-level
+    head is the two-wide continue/stop row `compute_logits` builds, so two is
+    what every `vocab_size` reader has to see.
+
+    The caller used to hand over `text_hidden_states`, so this landed on the
+    hidden width (768). That passes the `parse_output` filter by accident (0
+    and 1 are both below 768) and breaks the one reader that repays checking:
+    `InputBatch.add_request` stores `top_k = vocab_size` as its "no top-k"
+    sentinel, which only holds for 0 and 2. At 768 `top_k_reqs` stops being
+    empty, `sampling_metadata.top_k` stops being None, and the Ascend
+    `enable_reduce_sample` branch starts treating a two-column distribution as
+    a 768-way one. The stop row then does not survive into the request's token
+    list, so the request runs to `max_tokens` instead of stopping on EOS -- and
+    the frame stream that keeps arriving after the codec sequence ended is what
+    eventually hands the scheduler a step it cannot merge.
     """
     if logits is None or not getattr(runner.model, "supports_multi_frame_decode", False):
         return
     batch = getattr(runner, "input_batch", None)
-    width = int(logits.shape[-1])
+    width = STOP_ROW_WIDTH
     if batch is None or int(getattr(batch, "vocab_size", 0) or 0) >= width:
         return
     logger.info(
-        "[minicpmo] Talker input batch reported vocab_size=%s for a %s-wide stop row; "
-        "raising it so the rejection sampler's output survives parse_output",
+        "[minicpmo] Talker input batch reported vocab_size=%s; raising it to the "
+        "%d-wide stop row so parse_output keeps the accepted tokens",
         getattr(batch, "vocab_size", None),
         width,
     )

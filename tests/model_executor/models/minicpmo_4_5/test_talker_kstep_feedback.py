@@ -136,15 +136,22 @@ def _make_scheduler(*, num_spec: int, waiting=(), running=()):
     sched = OmniARScheduler.__new__(OmniARScheduler)
     sched._omni_talker_kstep_cache = None
     sched.speculative_config = SimpleNamespace(method="ngram", num_speculative_tokens=num_spec)
+    # vLLM's Scheduler stores the count here (vllm_config.num_speculative_tokens);
+    # the guard predicts row widths from it.
+    sched.num_spec_tokens = num_spec
+    sched.max_model_len = 40960
     sched.waiting = list(waiting)
     sched.running = list(running)
     return sched
 
 
-def _req(*, computed: int, prompt: int, spec: list[int]):
+def _req(*, computed: int, prompt: int, spec: list[int], total: int | None = None):
     return SimpleNamespace(
         num_computed_tokens=computed,
         prompt_token_ids=[0] * prompt,
+        # num_tokens is prompt + generated; the guard reads the difference to
+        # predict how many rows this request will schedule this step.
+        num_tokens=prompt if total is None else total,
         spec_token_ids=list(spec),
     )
 
@@ -160,7 +167,7 @@ def test_guard_drops_drafts_when_waiting_request_pending(monkeypatch):
 
 def test_guard_keeps_drafts_when_no_prefill_pending(monkeypatch):
     monkeypatch.setenv(_TALKER_FRAMES_ENV, "8")
-    decode_req = _req(computed=100, prompt=100, spec=[0] * 7)
+    decode_req = _req(computed=100, prompt=100, spec=[0] * 7, total=101)
     sched = _make_scheduler(num_spec=7, waiting=[], running=[decode_req])
 
     sched._drop_talker_drafts_if_prefill_pending()
@@ -169,7 +176,7 @@ def test_guard_keeps_drafts_when_no_prefill_pending(monkeypatch):
 
 def test_guard_drops_drafts_when_chunked_prefill_in_flight(monkeypatch):
     monkeypatch.setenv(_TALKER_FRAMES_ENV, "8")
-    decoding_req = _req(computed=100, prompt=100, spec=[0] * 7)
+    decoding_req = _req(computed=100, prompt=100, spec=[0] * 7, total=101)
     chunking_req = _req(computed=50, prompt=100, spec=[])
     sched = _make_scheduler(num_spec=7, waiting=[], running=[decoding_req, chunking_req])
 
@@ -184,6 +191,54 @@ def test_guard_noop_for_text_stage_spec_config(monkeypatch):
 
     sched._drop_talker_drafts_if_prefill_pending()
     assert text_req.spec_token_ids == [0] * 15
+
+
+def test_guard_arms_from_vllm_config_and_drops_drafts_for_a_running_chunk(monkeypatch):
+    # Real vLLM Scheduler instances expose no .speculative_config attribute
+    # (and SchedulerConfig has no num_speculative_tokens), so the armed check
+    # must read vllm_config.speculative_config -- otherwise the whole guard
+    # silently stays off while the engine-side loop is armed (the 11:47 and
+    # 12:04 crashes on 910B).
+    #
+    # 2026-09-18 12:39 crash: spans=[(0,7),(7,15)] -- a request carrying a
+    # 7-token streaming chunk shares the step with a steady-state decode that
+    # vLLM pads to 1+7 rows. Both spec_token_ids lists look innocent ([] and
+    # 7 placeholders), so the guard must predict row widths from
+    # num_tokens - num_computed_tokens instead.
+    from types import SimpleNamespace as NS
+
+    from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
+
+    monkeypatch.setenv(_TALKER_FRAMES_ENV, "8")
+    sched = OmniARScheduler.__new__(OmniARScheduler)
+    sched._omni_talker_kstep_cache = None
+    sched.vllm_config = NS(speculative_config=NS(method="ngram", num_speculative_tokens=7))
+    assert sched._talker_kstep_armed() is True
+    sched.num_spec_tokens = 7
+    sched.max_model_len = 40960
+
+    steady = _req(computed=100, prompt=100, spec=[0] * 7, total=101)  # 1 token -> 8 rows
+    chunk = _req(computed=107, prompt=107, spec=[], total=114)  # 7-token chunk -> 7 rows
+    sched.waiting = []
+    sched.running = [steady, chunk]
+
+    sched._drop_talker_drafts_if_prefill_pending()
+    assert steady.spec_token_ids == []
+    assert chunk.spec_token_ids == []
+
+
+def test_guard_keeps_drafts_when_all_decodes_share_the_padded_width(monkeypatch):
+    # A first-step decode (no placeholders yet) and a steady-state decode both
+    # schedule 1 token this step, so vLLM gives both the same 1+num_spec row
+    # width: spans stay uniform and nothing may drop.
+    monkeypatch.setenv(_TALKER_FRAMES_ENV, "8")
+    steady = _req(computed=100, prompt=100, spec=[0] * 7, total=101)
+    first_step = _req(computed=100, prompt=100, spec=[], total=101)
+    sched = _make_scheduler(num_spec=7, waiting=[], running=[steady, first_step])
+
+    sched._drop_talker_drafts_if_prefill_pending()
+    assert steady.spec_token_ids == [0] * 7
+    assert first_step.spec_token_ids == []
 
 
 def test_multiframe_gate_matrix():
@@ -224,3 +279,73 @@ def test_multiframe_gate_matrix():
     }
     assert talker_multiframe.applies(model, mixed_prefill) == 0
     assert talker_multiframe.is_multi_token_decode(model, mixed_prefill) is True
+
+
+def _vocab_runner(*, supports_multi_frame: bool, vocab_size: int):
+    return SimpleNamespace(
+        model=SimpleNamespace(supports_multi_frame_decode=supports_multi_frame),
+        input_batch=SimpleNamespace(vocab_size=vocab_size),
+    )
+
+
+def test_stop_vocab_gate_reports_the_two_wide_stop_row_not_the_hidden_width():
+    """``input_batch.vocab_size`` must be the stop row's width (2), not hidden.
+
+    ``InputBatch.add_request`` keeps ``top_k = vocab_size`` as its "no top-k"
+    sentinel and ``RejectionSampler.parse_output`` filters accepted tokens
+    against it; both only hold at 0 or 2. The gate used to be handed
+    ``text_hidden_states``, so it wrote the hidden width (768): that passes the
+    ``parse_output`` filter by accident while taking ``top_k`` out of its
+    sentinel range, and the two-wide stop row then never reaches the request's
+    token list -- every request runs to ``max_tokens`` instead of stopping on
+    EOS (the 910C scene where stage 1 reported ``finished_reason=length`` for
+    all 34 requests).
+    """
+    from vllm_omni.platforms.npu.worker import talker_multiframe
+
+    assert talker_multiframe.STOP_ROW_WIDTH == 2
+
+    runner = _vocab_runner(supports_multi_frame=True, vocab_size=0)
+    # Hidden-width rows on purpose: the width of this tensor is not the answer.
+    talker_multiframe.ensure_stop_token_vocab(runner, torch.randn(4, 768))
+    assert runner.input_batch.vocab_size == 2
+
+    # Idempotent: arming again must not move it.
+    talker_multiframe.ensure_stop_token_vocab(runner, torch.randn(4, 768))
+    assert runner.input_batch.vocab_size == 2
+
+
+def test_stop_vocab_gate_stays_off_without_multi_frame_or_rows():
+    from vllm_omni.platforms.npu.worker import talker_multiframe
+
+    # Single-frame models (K=1, stage 0/2) never take the branch that reads
+    # vocab_size; the gate must leave them exactly as they were.
+    single = _vocab_runner(supports_multi_frame=False, vocab_size=0)
+    talker_multiframe.ensure_stop_token_vocab(single, torch.randn(4, 768))
+    assert single.input_batch.vocab_size == 0
+
+    # No rows at hand: None must not be read as "width unknown, arm anyway".
+    armed = _vocab_runner(supports_multi_frame=True, vocab_size=0)
+    talker_multiframe.ensure_stop_token_vocab(armed, None)
+    assert armed.input_batch.vocab_size == 0
+
+
+def test_stop_trace_is_off_by_default_and_never_kills_the_step(monkeypatch):
+    from vllm_omni.platforms.npu.worker import talker_multiframe
+
+    monkeypatch.delenv(talker_multiframe._STOP_TRACE_ENV, raising=False)
+    monkeypatch.setattr(talker_multiframe, "_STOP_TRACE_COUNT", 0)
+    assert talker_multiframe.stop_trace_enabled() is False
+
+    # Worst input first: the diagnostic must degrade, never raise into the step.
+    talker_multiframe._trace_stop_rows([None])
+    assert talker_multiframe.stop_trace_enabled() is False
+
+    # Armed and well-formed: one row per request, one column per frame.
+    monkeypatch.setattr(talker_multiframe, "_STOP_TRACE_COUNT", 0)
+    monkeypatch.setenv(talker_multiframe._STOP_TRACE_ENV, "1")
+    assert talker_multiframe.stop_trace_enabled() is True
+    keep = torch.tensor([[0.0, -float("inf")]])
+    stop = torch.tensor([[-float("inf"), 0.0]])
+    talker_multiframe._trace_stop_rows([keep, stop, stop])
+    assert talker_multiframe.stop_trace_enabled() is True
