@@ -44,7 +44,7 @@ from vllm_ascend.attention.attention_v1 import (
     AscendAttentionState,
 )
 
-from vllm_omni.platforms.npu.attention import decode_attention_op, fixed_kv_decode, fixed_kv_prefill
+from vllm_omni.platforms.npu.attention import fixed_kv_decode, fixed_kv_prefill
 
 logger = init_logger(__name__)
 
@@ -287,13 +287,10 @@ class OmniFixedKVAttentionBackendImpl(AscendAttentionBackendImpl):
     ):
         """Capture one attention layer with no updatable task attached to it.
 
-        Two operators can serve this step. ``TalkerDecodeAttention`` is taken
-        when the shape is inside its declared domain: it reads the sequence
-        length from a device ``int32`` and costs 6.8 us. Otherwise the general
-        FIA runs, which needs its host arguments constant to be replayable --
-        so the op declares the full KV capacity and the live sequence length
-        arrives through ``pse_shift``, a device tensor the graph refreshes for
-        itself.
+        The general FIA serves this step; it needs its host arguments constant
+        to be replayable, so the op declares the full KV capacity and the live
+        sequence length arrives through ``pse_shift``, a device tensor the
+        graph refreshes for itself.
         """
         capacity = fixed_kv_decode.current_capacity()
         rows = len(attn_metadata.actual_seq_lengths_q)
@@ -304,25 +301,6 @@ class OmniFixedKVAttentionBackendImpl(AscendAttentionBackendImpl):
         pse = pse_all[:rows]
 
         seq_lens_device = attn_metadata.seq_lens_device
-        # FIA reads only the first `num_tokens` rows and ignores any padding
-        # above them; the bespoke operator takes the batch from the shape, so
-        # it is handed exactly those rows.
-        query_rows = query[:num_tokens]
-        # The bespoke operator takes the sequence length as a device int32 and
-        # reads only the pages the sequence occupies, so it needs no bias at
-        # all. Its own domain check runs first; anything outside it keeps FIA.
-        use_op = decode_attention_op.available() and decode_attention_op.applies(
-            query_rows,
-            key,
-            value,
-            seq_lens_device,
-            block_table,
-            block_size,
-            self.num_heads,
-            self.num_kv_heads,
-            rows,
-            q_len,
-        )
 
         if not attn_metadata.fixed_kv_mask_recorded:
             attn_metadata.fixed_kv_mask_recorded = True
@@ -335,28 +313,13 @@ class OmniFixedKVAttentionBackendImpl(AscendAttentionBackendImpl):
             )
             logger.info(
                 "[minicpmo] fixed-KV decode capture: graph_size=%d rows=%d q_len=%d "
-                "kv_capacity=%d heads=%d attention=%s",
+                "kv_capacity=%d heads=%d attention=FIA",
                 num_tokens,
                 rows,
                 q_len,
                 capacity,
                 self.num_heads,
-                "TalkerDecodeAttention" if use_op else "FIA",
             )
-
-        if use_op:
-            decode_attention_op.emit(
-                query_rows,
-                key,
-                value,
-                block_table,
-                seq_lens_device,
-                self.num_heads,
-                self.num_kv_heads,
-                self.scale,
-                output[:num_tokens].view(rows, self.num_heads, self.head_size),
-            )
-            return output.view(num_tokens, self.num_heads, self.head_size), num_tokens
 
         # The bias is per step, not per layer, and only the FIA path reads it,
         # so it is recorded by the first layer that actually wants it.

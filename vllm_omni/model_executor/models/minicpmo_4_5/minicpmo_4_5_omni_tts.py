@@ -37,11 +37,8 @@ from vllm_omni.engine.duplex.intermediate import get_tts_handoff
 from vllm_omni.model_executor.models.minicpmo_4_5 import MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_codec_sample import (
     MIN_TOKENS_TO_KEEP,
-    CodecStepGraph,
     TalkerCodecDeviceState,
     TalkerCodecSampleResult,
-    a14_accelerated,
-    a14_graph_enabled,
     codec_sample_result,
     greedy_codec_sample,
     make_device_state,
@@ -199,64 +196,6 @@ def _apply_top_k_top_p(
 
 
 _NPU_TOPK_CACHE: dict = {}
-_FUSED_SAMPLER = None
-if os.environ.get("MINICPMO_FUSED_SAMPLER_SAMPLER", "0") == "1":
-    try:
-        from vllm_omni.platforms.npu.ops_opt import fused_sampler as _FUSED_SAMPLER  # noqa: F811
-    except Exception:
-        _FUSED_SAMPLER = None
-
-# p130 online feasibility probe (observe-only): scores the ngram draft
-# proposer's top-1/2/4 recall on the live codec stream to decide whether
-# spec-decode integration is worth building. Never changes a sampled id.
-_SPEC_DRAFT_MOD = None
-if os.environ.get("MINICPMO_SPEC_DRAFT_PROBE", "0") == "1":
-    try:
-        from vllm_omni.platforms.npu.ops_opt import spec_draft as _SPEC_DRAFT_MOD
-    except Exception:
-        _SPEC_DRAFT_MOD = None
-_SPEC_DRAFT_PROBE: dict = {"buf": {}, "hits": {k: [0, 0] for k in (1, 2, 4)}, "batches": 0, "seen": 0}
-
-
-def _spec_draft_probe_observe(request_id, window_dev):
-    if _SPEC_DRAFT_MOD is None:
-        return
-    try:
-        probe = _SPEC_DRAFT_PROBE
-        buf = probe["buf"].setdefault(request_id, [])
-        buf.append(window_dev)
-        if sum(b.numel() for b in buf) < 256:
-            return
-        data = torch.cat(buf).tolist()
-        probe["buf"][request_id] = []
-        p = probe["proposer"]
-        if p is None or len(data) < 40:
-            return
-        if probe["seen"] > 12000:  # keep the ngram table windowed
-            probe["proposer"] = p = _SPEC_DRAFT_MOD.DraftProposer()
-            probe["seen"] = 0
-        hist, fresh = data[:-16], data[-16:]
-        p.observe(hist)
-        for i, tok in enumerate(fresh):
-            ctx = (hist + fresh[:i])[-32:]
-            if len(ctx) >= 4:
-                for k in (1, 2, 4):
-                    prop = p.propose(ctx, k)
-                    h = probe["hits"][k]
-                    h[0] += int(bool(prop) and prop[0] == tok)
-                    h[1] += 1
-            p.observe([tok])
-        probe["seen"] += len(data)
-        probe["batches"] += 1
-        if probe["batches"] % 20 == 0:
-            h = probe["hits"]
-            logger.info(
-                "[minicpmo] ngram draft probe: top-1=%.3f top-2=%.3f top-4=%.3f (n=%d)",
-                h[1][0] / max(1, h[1][1]), h[2][0] / max(1, h[2][1]),
-                h[4][0] / max(1, h[4][1]), h[1][1],
-            )
-    except Exception:
-        pass
 _NPU_TOP_K_TOP_P = os.environ.get("MINICPMO_TTS_NPU_TOPK_TOPP", "1") != "0"
 # npu_top_k_top_p wins on launches at small batch but loses to the two-op
 # torch path at large batch (128/8 A/B: 1.391 gated-off vs on).
@@ -483,8 +422,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self._request_audio_states: dict[str, dict[str, Any]] = {}
         self._request_codec_device_states: dict[str, TalkerCodecDeviceState] = {}
         self._request_codec_device_inputs: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
-        self._codec_step_graph: CodecStepGraph | None = None
-        self._codec_step_graph_failed = False
 
         self._init_native_talker(prefix)
 
@@ -1117,42 +1054,11 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             else:
                 stochastic_result = self._sample_audio_code(hidden[end - 1 : end], codes, request_id, step)
                 if isinstance(stochastic_result, TalkerCodecSampleResult):
-                    sampled_result = stochastic_result
-                    sampled = sampled_result.sampled_token.reshape(()).to(torch.long)
+                    sampled = stochastic_result.sampled_token.reshape(()).to(torch.long)
                 else:
                     # CPU unit tests and downstream subclasses historically
                     # stub this method with the sampled tensor itself.
-                    sampled_result = None
                     sampled = stochastic_result.reshape(()).to(torch.long)
-            if a14_accelerated() and self._codec_temperature != 0.0:
-                # Keep codec state, EOS/limit routing and the emitted token on
-                # device. The NPU runner already performs one coalesced D2H for
-                # the stop token and multimodal payload after sampling, so do
-                # not add a second mid-frame synchronization here.
-                if sampled_result is None:
-                    raise RuntimeError("the A14 codec boundary needs device-resident sample state")
-                state["step"] = _codec_int_param(state, "step", 0) + 1
-                info["audio_state"] = state
-                info["audio_codes"] = {
-                    "current": sampled.reshape(1),
-                    "accumulated": codes,
-                }
-                if sampled_result.delta is not None and sampled_result.stop_row is not None:
-                    # The captured step already masked both.
-                    delta = sampled_result.delta
-                    stop_row = sampled_result.stop_row
-                else:
-                    invalid_delta = torch.full_like(sampled.reshape(1, 1), -1)
-                    delta = torch.where(sampled_result.emit.reshape(1, 1), sampled.reshape(1, 1), invalid_delta)
-                    stop_row = torch.where(
-                        sampled_result.state.finished.reshape(1),
-                        row_stop,
-                        row_continue,
-                    )
-                codec_deltas.append(delta)
-                terminal_flags.append(sampled_result.state.finished.reshape(()))
-                stop_rows.append(stop_row)
-                continue
             sampled_id = int(sampled.item())
             is_eos = sampled_id == self._num_audio_tokens - 1
             state["step"] = _codec_int_param(state, "step", 0) + 1
@@ -1269,94 +1175,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             self._request_generators[request_id] = generator
         return generator
 
-    def _codec_step_graph_for(
-        self,
-        request_id: str,
-        hidden_state: torch.Tensor,
-        device_state: TalkerCodecDeviceState,
-        device_inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-        *,
-        new_segment: bool,
-    ) -> CodecStepGraph | None:
-        """Return the captured codec step if this request may use it.
-
-        One graph exists per process and one request holds it at a time. A
-        request that is already sampling eagerly keeps its own Generator and is
-        never migrated mid-stream, because the graph's RNG state is a different
-        stream and switching would change the tokens.
-        """
-        if not a14_graph_enabled() or getattr(self, "_codec_step_graph_failed", False):
-            return None
-        if not a14_accelerated():
-            # The graph is only worth its bookkeeping alongside the fused,
-            # device-resident output path. Auto mode reaches this path only
-            # when the optional operator loaded successfully.
-            return None
-        if self._codec_temperature == 0.0 or hidden_state.device.type != "npu":
-            return None
-        eos_id = self._num_audio_tokens - 1
-        graph = getattr(self, "_codec_step_graph", None)
-        if graph is not None and graph.owner == request_id:
-            return graph
-        if not new_segment:
-            # Mid-segment adoption would restart or jump the RNG stream.
-            return None
-        if graph is None:
-            row_continue, row_stop, _, _, _ = self._step_constants(hidden_state)
-            graph = CodecStepGraph(
-                self.head_code[0],
-                device=hidden_state.device,
-                hidden_dtype=hidden_state.dtype,
-                hidden_size=int(hidden_state.shape[-1]),
-                eos_token_id=eos_id,
-                top_k=self._codec_top_k,
-                top_p=self._codec_top_p,
-                min_tokens_to_keep=MIN_TOKENS_TO_KEEP,
-                seed=self._codec_seed,
-                row_continue=row_continue,
-                row_stop=row_stop,
-            )
-            if torch.npu.is_current_stream_capturing():
-                # Never nest inside vLLM's own ACL graph capture.
-                return None
-            try:
-                graph.capture()
-            except Exception:
-                logger.exception("A14 codec step graph capture failed; falling back to the eager chain")
-                self._codec_step_graph_failed = True
-                return None
-            logger.info(
-                "A14 codec step graph captured (top_k=%s, top_p=%s, eos=%s): the per-frame "
-                "post-head chain now runs as one replay",
-                self._codec_top_k,
-                self._codec_top_p,
-                eos_id,
-            )
-            self._codec_step_graph = graph
-        if graph.owner is not None:
-            # Another live request holds it; this one samples eagerly.
-            return None
-        if not graph.matches(
-            eos_token_id=eos_id,
-            top_k=self._codec_top_k,
-            top_p=self._codec_top_p,
-            min_tokens_to_keep=MIN_TOKENS_TO_KEEP,
-        ):
-            return None
-        if hidden_state.dtype != graph.hidden_dtype:
-            return None
-        existing = self._request_generators.get(request_id)
-        if existing is not None and existing is not graph.generator:
-            return None
-        if existing is None:
-            # A request the eager path never touched: start its stream the way
-            # ``_request_generator`` would have.
-            graph.seed_generator()
-            self._request_generators[request_id] = graph.generator
-        min_tokens_tensor, temperature_tensor, penalty_tensor = device_inputs
-        graph.bind(request_id, device_state, min_tokens_tensor, temperature_tensor, penalty_tensor)
-        return graph
-
     def _sample_audio_code(
         self,
         hidden_state: torch.Tensor,
@@ -1402,17 +1220,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 ),
             )
             device_inputs_by_request[request_id] = device_inputs
-        graph = self._codec_step_graph_for(
-            request_id,
-            hidden_state,
-            device_state,
-            device_inputs,
-            new_segment=new_segment,
-        )
-        if graph is not None:
-            # One replay covers head_code, the A14 filter, softmax, multinomial
-            # and the state transition; the segment state lives in the graph.
-            return graph.step(hidden_state)
         min_tokens_tensor, temperature_tensor, penalty_tensor = device_inputs
         eos_id = self._num_audio_tokens - 1
         logits = prepare_codec_logits(
@@ -1449,9 +1256,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         min_tokens: int,
         max_tokens: int,
     ) -> torch.Tensor:
-        """Run the first A14 boundary while keeping sampler state on device.
+        """Run the greedy codec boundary while keeping sampler state on device.
 
-        The optional AscendC op and the torch reference share this call site.
         Host stop routing still consumes ``sampled.item()`` below; removing that
         sync requires a runner/connector state refactor and is not hidden here.
         """
@@ -1532,8 +1338,9 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
         ``make_omni_output`` reports the flag on the frame that ended the codec
         sequence and reports ``False`` for every frame after it, so the step's
-        answer is the OR. The flags are device tensors on the A14 path and CPU
-        constants on the native-sampler path, and one step can produce both --
+        answer is the OR. The flags are device tensors on the device-state
+        path and CPU constants on the native-sampler path, and one step can
+        produce both --
         the frame that finishes samples on device, the frames after it take the
         early return and get the CPU constant. Reading the CPU ones costs
         nothing; the device ones are OR'd on device and travel out in the

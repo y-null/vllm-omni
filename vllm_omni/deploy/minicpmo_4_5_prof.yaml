@@ -180,19 +180,9 @@ platforms:
           # expansion (PIECEWISE silently disables them).
           cudagraph_mode: FULL_AND_PIECEWISE
         env:
-          # A14 is the packaged fused codec-boundary operator. Left off: its
-          # binary corrupts the heap on 910B and faults the vector core on
-          # 910_93 (see talker_codec_sample.a14_mode). Set
-          # VLLM_OMNI_A14_MODE=auto once a payload is verified for the part.
-          VLLM_OMNI_A14_MODE: off
-          VLLM_OMNI_A14_GRAPH: "1"
           # step-level profiling: without these the stage worker imports
           # step_prof.py with _ENABLED=false and every tic/toc is a no-op.
           OMNI_STEP_PROF: "0"
-          # Rebuilt TalkerDecodeAttention loads and runs standalone, but CANN
-          # refuses its binary inside the stage process (ACL 161001, SoC not
-          # configured). Keep the FIA path until that is resolved.
-          VLLM_OMNI_TALKER_DECODE_OP: "1"
           OMNI_STEP_PROF_FLUSH: "200"
       - stage_id: 2
         max_num_seqs: 8

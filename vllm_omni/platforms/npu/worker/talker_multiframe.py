@@ -101,7 +101,7 @@ def _narrow_soc_allows() -> bool:
         return False
 
     name = ""
-    for variable in ("VLLM_OMNI_A14_SOC", "SOC_VERSION", "ASCEND_SOC_VERSION"):
+    for variable in ("SOC_VERSION", "ASCEND_SOC_VERSION"):
         value = os.environ.get(variable, "").strip().lower()
         if value:
             name = value

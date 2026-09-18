@@ -809,7 +809,7 @@ _MINICPMO_TALKER_FRAMES_MAX = 16
 _MINICPMO_FRAMES_OFF = ("0", "1", "off", "false", "no")
 
 
-_SOC_ENV_VARS = ("VLLM_OMNI_A14_SOC", "SOC_VERSION", "ASCEND_SOC_VERSION")
+_SOC_ENV_VARS = ("SOC_VERSION", "ASCEND_SOC_VERSION")
 
 
 def _soc_name_from_env() -> str:
