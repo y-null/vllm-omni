@@ -423,6 +423,9 @@ class Orchestrator:
     _transfer_emitter: Any = None
     _prom_metrics: Any = None
     _stat_logger: OmniPrometheusStatLogger | None = None
+    # Widest spec per-position accept list any stage can emit (num_spec + 1);
+    # 0 disables padding. Set in __init__ next to _stat_logger.
+    _spec_pos_pad_to: int = 0
     duplex_control_plane: DuplexControlPlanePort | None = None
 
     def __init__(
@@ -580,12 +583,18 @@ class Orchestrator:
                 vllm_config=vllm_config_for_stats,
                 stage_replica_map=stage_replica_map,
             )
+            # The logger's spec-decoding collector was built from ONE stage's
+            # config while every stage feeds it; remember the widest
+            # per-position accept list any stage can emit so shorter lists
+            # can be zero-padded before record() (see _pad_spec_positions).
+            self._spec_pos_pad_to = self._max_spec_positions(stage_pools)
         except Exception:
             # Minimal vllm_config in unit-test contexts can lack fields the
             # upstream PrometheusStatLogger expects. Skip wrap rather than
             # break orchestrator construction.
             logger.exception("[Orchestrator] OmniPrometheusStatLogger init failed; metrics wrap disabled")
             self._stat_logger = None
+            self._spec_pos_pad_to = 0
 
     @property
     def duplex_sessions(self) -> DuplexSessionRuntimeManager:
@@ -1143,11 +1152,23 @@ class Orchestrator:
             iteration_stats=iteration_stats,
         )
         if self._stat_logger is not None and (raw_outputs.scheduler_stats is not None or iteration_stats is not None):
-            self._stat_logger.record(
-                raw_outputs.scheduler_stats,
-                iteration_stats,
-                engine_idx=self._stage_replica_to_engine_idx[(stage_id, replica_id)],
-            )
+            # Metrics must never kill the engine. The logger is built from one
+            # stage's vllm_config while every stage feeds it, so a shape
+            # mismatch (or any upstream stats change) must degrade to a logged
+            # skip -- never an orchestrator-thread death and EngineDeadError.
+            try:
+                self._pad_spec_positions(raw_outputs.scheduler_stats)
+                self._stat_logger.record(
+                    raw_outputs.scheduler_stats,
+                    iteration_stats,
+                    engine_idx=self._stage_replica_to_engine_idx[(stage_id, replica_id)],
+                )
+            except Exception:
+                logger.exception(
+                    "[Orchestrator] stat logger record failed for stage %s replica %s; skipping this sample",
+                    stage_id,
+                    replica_id,
+                )
         _sched_stats = raw_outputs.scheduler_stats
         if (
             self._prom_metrics is not None
@@ -1160,6 +1181,40 @@ class Orchestrator:
                 int(_sched_stats.num_waiting_reqs),
             )
         return processed
+
+    def _max_spec_positions(self, stage_pools: list[Any]) -> int:
+        """Largest per-position accept list any stage can emit (num_spec + 1).
+
+        The stat logger is built from the first stage's vllm_config, so its
+        spec-decoding collector iterates that stage's draft count. A later
+        stage carrying its own (smaller) speculative_config emits shorter
+        per-position lists; recording one against the longer expectation
+        raises IndexError inside the orchestrator thread -- which takes the
+        whole engine down (hit for real when the Talker K-step, 7 drafts,
+        produced its first stats beside the text stage's 15-draft n-gram).
+        """
+        best = 0
+        for pool in stage_pools or []:
+            cfg = getattr(pool, "stage_vllm_config", None)
+            spec = getattr(cfg, "speculative_config", None) if cfg is not None else None
+            num_spec = getattr(spec, "num_speculative_tokens", 0) or 0
+            best = max(best, num_spec + 1)
+        return best
+
+    def _pad_spec_positions(self, scheduler_stats: Any) -> None:
+        """Zero-pad a stage's per-position accept list to the logger's width.
+
+        Padded positions belong to draft slots the shorter-config stage does
+        not have; they never accept, so 0 is the truthful value. Mutating the
+        list in place is safe: the stats object is not shared beyond this
+        record call.
+        """
+        if self._spec_pos_pad_to <= 0 or scheduler_stats is None:
+            return
+        spec = getattr(scheduler_stats, "spec_decoding_stats", None)
+        per_pos = getattr(spec, "num_accepted_tokens_per_pos", None)
+        if isinstance(per_pos, list) and len(per_pos) < self._spec_pos_pad_to:
+            per_pos.extend([0] * (self._spec_pos_pad_to - len(per_pos)))
 
     def _absorb_diffusion_metrics(self, stage_id: int, replica_id: int, diffusion_output: Any) -> bool:
         """Drain a diffusion output's piggybacked metrics.
