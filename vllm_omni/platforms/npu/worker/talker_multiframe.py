@@ -758,6 +758,11 @@ def _write_frame_embeddings(
 # names in `stop_token_ids`.
 CONTINUE_TOKEN_ID = 0
 
+# Width of the Talker vLLM-level head: the two-wide continue/stop row.
+# input_batch.vocab_size must report the same, because InputBatch stores
+# top_k = vocab_size as its no-top-k sentinel and that holds only for 0 or 2.
+STOP_ROW_WIDTH = 2
+
 
 def drafts_this_step(runner: Any) -> int:
     """Frames the *next* step should be scheduled for, or 0 to stay generic.
