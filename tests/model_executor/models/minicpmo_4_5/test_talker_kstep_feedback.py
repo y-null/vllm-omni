@@ -349,3 +349,64 @@ def test_stop_trace_is_off_by_default_and_never_kills_the_step(monkeypatch):
     stop = torch.tensor([[-float("inf"), 0.0]])
     talker_multiframe._trace_stop_rows([keep, stop, stop])
     assert talker_multiframe.stop_trace_enabled() is True
+
+
+class _MinTokensLogitsProcessor:
+    """名字就是契约：实现按 ``type(proc).__name__`` 匹配。"""
+
+    def __init__(self, min_toks):
+        self.min_toks = min_toks
+
+
+def test_kstep_min_tokens_neutralization_clears_the_censor_list():
+    """K 步下 vLLM 层 min_tokens 的名单必须被清空。
+
+    它 mask 的是唯一的停止信号（binary stop 行的 id 1），而解除条件是
+    ``len(output_token_ids) >= min_tokens``——那个长度归 vLLM 的 spec 记账管，
+    计数不推进请求就永远停不下来（910C 现场 stage1 全 ``length``、0 ``stop``）。
+    模型内已用 ``state.step < min_tokens`` 压 codec EOS，这一层是重复的。
+    """
+    from vllm_omni.platforms.npu.worker import talker_multiframe
+
+    censor = _MinTokensLogitsProcessor({0: (50, [0, 0, 0], {1})})
+    untouched = _MinTokensLogitsProcessor({0: (50, [0], {1})})
+    untouched.__class__ = type("SomeOtherProcessor", (object,), {})  # 非目标处理器
+
+    talker_multiframe.neutralize_kstep_min_tokens(
+        SimpleNamespace(non_argmax_invariant=[untouched, censor])
+    )
+    assert censor.min_toks == {}
+    assert untouched.min_toks == {0: (50, [0], {1})}
+
+    # 空名单 / 怪输入都不能炸。
+    talker_multiframe.neutralize_kstep_min_tokens(
+        SimpleNamespace(non_argmax_invariant=[])
+    )
+    talker_multiframe.neutralize_kstep_min_tokens(None)
+
+
+def test_kstep_bookkeeping_trace_is_total(monkeypatch):
+    """记账层诊断：正常输入打一行，最坏输入只关掉自己。"""
+    from vllm_omni.platforms.npu.worker import talker_multiframe
+
+    monkeypatch.setenv(talker_multiframe._STOP_TRACE_ENV, "1")
+    monkeypatch.setattr(talker_multiframe, "_STOP_KB_COUNT", 0)
+
+    runner = SimpleNamespace(
+        input_batch=SimpleNamespace(
+            sampling_metadata=SimpleNamespace(
+                logitsprocs=SimpleNamespace(
+                    non_argmax_invariant=[
+                        _MinTokensLogitsProcessor({0: (50, [0, 0], {1})})
+                    ]
+                )
+            )
+        )
+    )
+    talker_multiframe.trace_kstep_bookkeeping(runner, [[0, 0, 1]], torch.zeros(2, 2))
+    assert talker_multiframe.stop_trace_enabled() is True
+
+    # 最坏输入：诊断必须降级，绝不抛回 decode 步里。
+    monkeypatch.setattr(talker_multiframe, "_STOP_KB_COUNT", 0)
+    talker_multiframe.trace_kstep_bookkeeping(None, None, None)
+    assert talker_multiframe.stop_trace_enabled() is False

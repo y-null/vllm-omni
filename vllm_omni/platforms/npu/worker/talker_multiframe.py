@@ -297,6 +297,85 @@ def _trace_stop_rows(frame_stop_logits: list[torch.Tensor]) -> None:
         os.environ[_STOP_TRACE_ENV] = "0"
 
 
+_STOP_KB_COUNT = 0
+
+
+def trace_kstep_bookkeeping(runner: Any, valid_sampled_token_ids: Any, logits: Any) -> None:
+    """[kstep-stop] 第二层：stop 走完 spec 记账之后还剩什么。
+
+    两条事实一起打，一次就能把"stop 去哪了"钉死在某一层：
+
+    * ``carried`` -- rejection sampler 交给请求的 token 序列（前 4 个请求）。
+      里面有 1 说明 stop 进了请求自己的 token 表，后面就只剩 engine 侧的结束判定；
+      一排 0 而没有 1 说明 stop 在到这里之前就没了。
+    * ``min_toks`` -- vLLM 的 MinTokens 处理器里还有哪些请求在 mask 名单上，
+      以及它看到的 output 长度（``(index, min_tokens, len(output_token_ids),
+      sorted(stop_ids))``）。**只要某个请求还在这张名单上，它的 stop 列就是
+      -inf**；如果 ``len(output_token_ids)`` 始终不涨，这张名单就永远不会被
+      清掉，请求也就永远停不下来。
+
+    诊断组件永不抛异常：出错只关掉自己。
+    """
+    global _STOP_KB_COUNT
+    try:
+        if _STOP_KB_COUNT >= _STOP_TRACE_STEPS:
+            return
+        _STOP_KB_COUNT += 1
+        if isinstance(valid_sampled_token_ids, list):
+            carried: Any = [list(row) for row in valid_sampled_token_ids[:4]]
+        else:
+            carried = "<%s>" % type(valid_sampled_token_ids).__name__
+
+        masks: list[Any] = []
+        sampling_metadata = getattr(getattr(runner, "input_batch", None), "sampling_metadata", None)
+        for proc in getattr(getattr(sampling_metadata, "logitsprocs", None), "non_argmax_invariant", None) or []:
+            min_toks = getattr(proc, "min_toks", None)
+            if isinstance(min_toks, dict) and min_toks:
+                masks.append(
+                    [
+                        (index, int(min_tok), len(out_ids), sorted(stop_ids))
+                        for index, (min_tok, out_ids, stop_ids) in list(min_toks.items())[:4]
+                    ]
+                )
+        logger.info(
+            "[kstep-stop] carried=%s min_toks=%s logits=%s",
+            carried,
+            masks,
+            tuple(getattr(logits, "shape", ()) or ()),
+        )
+    except Exception as exc:
+        logger.warning("[kstep-stop] bookkeeping trace disabled after failure: %r", exc)
+        os.environ[_STOP_TRACE_ENV] = "0"
+
+
+def neutralize_kstep_min_tokens(logitsprocs: Any) -> None:
+    """K 步下让 vLLM 层的 ``min_tokens`` 不再 censoring 停止信号。
+
+    yaml 的 ``min_tokens: 50`` 在 K 步下是通过 **把 stop token（id 1）的 logit
+    置成 -inf** 实现的（``MinTokensLogitsProcessor``）。它自己的解除条件是
+    ``len(output_token_ids) >= min_tokens``，而这个长度归 vLLM 的 spec 记账管；
+    只要那个计数没有推进到位，请求唯一的停止信号就被永久 mask，
+    ``finished_reason`` 只能是 ``length``（910C 现场：stage1 全 length、0 stop）。
+
+    真正的"最小帧数"保护不在这里：``talker_codec_sample.greedy_codec_sample``
+    用 ``state.step < min_tokens`` 把 codec EOS 本身压成 -inf，用的是模型自己
+    的帧计数，与 vLLM 的 token 记账无关。所以这一层是重复的、且在 K 步下会
+    把停止信号一起吃掉 —— 清空它的名单，把最小长度交还给模型内的那道保护。
+
+    ``min_toks`` 每个 step 都会被 ``update_state`` 重新登记，所以本函数必须
+    每步调用（调用点在 runner 的采样前）。永不抛异常。
+    """
+    try:
+        for proc in getattr(logitsprocs, "non_argmax_invariant", None) or []:
+            if type(proc).__name__ != "MinTokensLogitsProcessor":
+                continue
+            min_toks = getattr(proc, "min_toks", None)
+            if isinstance(min_toks, dict) and min_toks:
+                min_toks.clear()
+    except Exception as exc:
+        logger.warning("[minicpmo] K-step min_tokens neutralization skipped: %r", exc)
+
+
 _LOGGED_BLOCK: str | None = None
 _LOGGED_NARROW = False
 _LOGGED_NARROW_BLOCK: str | None = None

@@ -1179,6 +1179,17 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 self.input_batch.sampling_metadata.logitsprocs,
                 logits.shape[-1],
             )
+            if getattr(self.model, "supports_multi_frame_decode", False):
+                # K-step only: this layer censors the stop token itself, and its
+                # release condition is a spec-decoding bookkeeping counter we do
+                # not control -- a request whose count never advances can never
+                # stop. The model already masks the codec EOS by its own frame
+                # count (talker_codec_sample), so clear this list every step.
+                from vllm_omni.platforms.npu.worker import talker_multiframe
+
+                talker_multiframe.neutralize_kstep_min_tokens(
+                    self.input_batch.sampling_metadata.logitsprocs
+                )
         #  -------------------------------------- Omni-new -------------------------------------------------
 
 
@@ -1245,6 +1256,14 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             scheduler_output.total_num_scheduled_tokens,
             spec_decode_metadata,
         )
+
+        if getattr(self.model, "supports_multi_frame_decode", False):
+            from vllm_omni.platforms.npu.worker import talker_multiframe
+
+            if talker_multiframe.stop_trace_enabled():
+                talker_multiframe.trace_kstep_bookkeeping(
+                    self, valid_sampled_token_ids, logits
+                )
 
         with record_function_or_nullcontext("draft_token"):
             if self.speculative_config:
