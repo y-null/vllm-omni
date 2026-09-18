@@ -258,9 +258,42 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
 
         frames = talker_multiframe.drafts_this_step(self)
         if frames > 1:
-            return talker_multiframe.constant_drafts(
+            if not isinstance(valid_sampled_token_ids, list):
+                # The padded-drafter branch passes the verify output tensor;
+                # `constant_drafts` can only read list rows, so if we ever
+                # get here the K-step silently degrades to single frames
+                # every step. Name the branch so the first scene is the last.
+                logger.error(
+                    "[kstep] propose received %s (expected list); "
+                    "constant_drafts will emit no drafts this step "
+                    "(use_ngram_gpu=%s, padded_drafter_disabled=%s)",
+                    type(valid_sampled_token_ids).__name__,
+                    self.speculative_config.use_ngram_gpu()
+                    if self.speculative_config is not None
+                    else None,
+                    self.speculative_config.disable_padded_drafter_batch
+                    if self.speculative_config is not None
+                    else None,
+                )
+            drafts = talker_multiframe.constant_drafts(
                 valid_sampled_token_ids, frames, self.input_batch.num_reqs
             )
+            if not any(drafts):
+                # Dump the rows as they were seen. An all-empty batch here is
+                # the stall signature: name WHICH request and what shape the
+                # step returned instead of leaving one log line to reason from.
+                rows = list(valid_sampled_token_ids or [])
+                logger.error(
+                    "[kstep] no drafts emitted: frames=%s num_reqs=%s rows=%s "
+                    "row_types=%s row_lens=%s head=%s",
+                    frames,
+                    self.input_batch.num_reqs,
+                    len(rows),
+                    [type(r).__name__ for r in rows[:8]],
+                    [len(r) for r in rows[:8] if isinstance(r, list)],
+                    repr(rows)[:400],
+                )
+            return drafts
         drafts = super().propose_draft_token_ids(valid_sampled_token_ids, *args, **kwargs)
         if stage0_tail_draft.applies(self):
             drafts = stage0_tail_draft.rewrite(

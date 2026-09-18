@@ -523,17 +523,43 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # P17 layer C: this request had drafts scheduled but its row
                 # came back with no generated tokens while the step itself
                 # sampled (a logprob-contract failure emptied the row above,
-                # the rejection sampler dropped every token, ...). The D draft
+                # the rejection sampler dropped every token, ...). The draft
                 # tokens were counted as computed but none of them will ever
-                # produce output, so roll all D back -- otherwise the next
+                # produce output, so roll them back -- otherwise the next
                 # step schedules a negative count and the engine stalls.
-                # The rollback is D, not upstream's D + 1: a prefill step
-                # scheduled chunk_len + D and consumed chunk_len.
+                # A prefill-chunk row is different: the chunk's prompt tokens
+                # did land in the KV cache, so only the D drafts roll back
+                # (the case entry_02 measured; the base token stays advanced).
+                # A pure-decode row that came back empty rolls the base token
+                # back too -- schedule() optimistically advanced all scheduled
+                # tokens and not one of them produced output.
                 _drafts = len(scheduled_spec_token_ids)
-                if request.num_computed_tokens >= _drafts:
-                    request.num_computed_tokens -= _drafts
-                if request.num_output_placeholders >= _drafts:
-                    request.num_output_placeholders -= _drafts
+                _scheduled = num_tokens_scheduled
+                _prev_computed = request.num_computed_tokens - _scheduled
+                _prompt_len = (
+                    len(request.prompt_token_ids)
+                    if getattr(request, "prompt_token_ids", None) is not None
+                    else 0
+                )
+                _is_prefill_row = _prev_computed < _prompt_len
+                _rollback = _drafts if _is_prefill_row else min(_scheduled, _drafts + 1)
+                logger.error(
+                    "K-step: request %s returned an empty row on a %s step "
+                    "(scheduled=%s drafts=%s computed=%s prompt_len=%s); "
+                    "rolling back %s. An empty decode row is never expected "
+                    "from the verify path -- this log is the stall signature.",
+                    req_id,
+                    "prefill" if _is_prefill_row else "decode",
+                    _scheduled,
+                    _drafts,
+                    request.num_computed_tokens,
+                    _prompt_len,
+                    _rollback,
+                )
+                if request.num_computed_tokens >= _rollback:
+                    request.num_computed_tokens -= _rollback
+                if request.num_output_placeholders >= _rollback:
+                    request.num_output_placeholders -= _rollback
 
             # Free encoder inputs only after the step has actually executed.
             if request.has_encoder_inputs:
