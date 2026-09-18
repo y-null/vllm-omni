@@ -57,6 +57,7 @@ from __future__ import annotations
 import dataclasses
 import os
 from dataclasses import dataclass
+from time import perf_counter
 from typing import Any, Callable
 
 import torch
@@ -65,6 +66,195 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 _LOGGED_ENGAGE = False
+
+# ---------------------------------------------------------------------------
+# K 步逐帧计时（默认关，关掉时 run() 里一个 timer 都不取）
+#
+#   VLLM_OMNI_MINICPMO_KSTEP_PROF=1        打开
+#   VLLM_OMNI_MINICPMO_KSTEP_PROF_STEPS=3  前 N 个 step 逐帧打点并做设备同步取样
+#   VLLM_OMNI_MINICPMO_KSTEP_PROF_EVERY=25 每 N 个 step 打一行累计摘要
+#
+# 要回答的问题只有一个：一步 8 帧的墙钟时间，到底花在 host 入队（replay/after_forward）
+# 还是花在设备执行上。replay/after_forward 是入队耗时（异步），synced 是在其后加一次
+# 设备同步测到的真实帧耗时 —— 两者相差多少，就是设备侧的账。
+# 诊断代码永不许抛异常：任何异常只把本 profiling 永久关掉并记一条 warning。
+# ---------------------------------------------------------------------------
+_PROF_ENV = "VLLM_OMNI_MINICPMO_KSTEP_PROF"
+_PROF_STEPS_ENV = "VLLM_OMNI_MINICPMO_KSTEP_PROF_STEPS"
+_PROF_EVERY_ENV = "VLLM_OMNI_MINICPMO_KSTEP_PROF_EVERY"
+_PROF_OFF = ("0", "false", "no", "off")
+_PROF_STEPS_DEFAULT = 3
+_PROF_EVERY_DEFAULT = 25
+
+
+class _StepProf:
+    """One step's timers. Never raises: profiling is best-effort by contract."""
+
+    __slots__ = ("frames", "replay_ms", "after_ms", "detail")
+
+    def __init__(self, frames: int, *, detail: bool) -> None:
+        self.frames = frames
+        self.replay_ms = 0.0
+        self.after_ms = 0.0
+        self.detail = detail
+
+
+def prof_enabled() -> bool:
+    """Off unless the env explicitly turns it on (``1``/``true``/``yes``/``on``)."""
+    try:
+        raw = os.environ.get(_PROF_ENV, "").strip().lower()
+        return bool(raw) and raw not in _PROF_OFF
+    except Exception:  # pragma: no cover - env is a dict lookup, but be total
+        return False
+
+
+def _prof_steps() -> int:
+    try:
+        raw = os.environ.get(_PROF_STEPS_ENV, "").strip()
+        steps = int(raw) if raw else _PROF_STEPS_DEFAULT
+    except Exception:
+        steps = _PROF_STEPS_DEFAULT
+    return max(steps, 0)
+
+
+def _prof_every() -> int:
+    try:
+        raw = os.environ.get(_PROF_EVERY_ENV, "").strip()
+        every = int(raw) if raw else _PROF_EVERY_DEFAULT
+    except Exception:
+        every = _PROF_EVERY_DEFAULT
+    return max(every, 1)
+
+
+def _prof_sync() -> None:
+    """Best-effort device drain; no-op on a build without the op."""
+    for fn in (
+        getattr(getattr(torch, "npu", None), "synchronize", None),
+        getattr(getattr(torch, "cuda", None), "synchronize", None),
+    ):
+        if callable(fn):
+            try:
+                fn()
+                return
+            except Exception:
+                return
+
+
+def _prof_frame_line(step: int, frame: int, replay_ms: float, after_ms: float, synced_ms: float) -> None:
+    try:
+        logger.info(
+            "[kstep-prof] step=%d frame=%d replay_ms=%.3f after_forward_ms=%.3f synced_frame_ms=%s",
+            step,
+            frame,
+            replay_ms,
+            after_ms,
+            f"{synced_ms:.3f}" if synced_ms >= 0.0 else "n/a",
+        )
+    except Exception:
+        pass
+
+
+def _prof_summary(steps: int, frames_total: int, last_frames: int, *, detail: bool) -> None:
+    """累计一行：每步/每帧墙钟，以及 host 入队与设备执行各自的账。"""
+    try:
+        per_step = _PROF_TOTAL_MS / steps if steps else 0.0
+        per_frame = _PROF_TOTAL_MS / frames_total if frames_total else 0.0
+        replay_per_frame = _PROF_REPLAY_MS / frames_total if frames_total else 0.0
+        after_per_frame = _PROF_AFTER_MS / frames_total if frames_total else 0.0
+        synced = (
+            f" synced_frame_ms={_PROF_SYNCED_MS / _PROF_SYNCED_FRAMES:.3f}"
+            f" (n={_PROF_SYNCED_FRAMES})"
+            if _PROF_SYNCED_FRAMES
+            else ""
+        )
+        logger.info(
+            "[kstep-prof] steps=%d frames=%d last_step_frames=%d step_ms=%.2f frame_ms=%.3f "
+            "replay_enqueue_ms_per_frame=%.3f after_forward_ms_per_frame=%.3f (totals: %.3f/%.3f)%s%s",
+            steps,
+            frames_total,
+            last_frames,
+            per_step,
+            per_frame,
+            replay_per_frame,
+            after_per_frame,
+            _PROF_REPLAY_MS,
+            _PROF_AFTER_MS,
+            synced,
+            "  [per-frame lines above]" if detail else "",
+        )
+    except Exception:
+        pass
+
+
+_PROF_WARNED = False
+_PROF_STEPS = 0
+_PROF_FRAMES = 0
+_PROF_REPLAY_MS = 0.0
+_PROF_AFTER_MS = 0.0
+_PROF_TOTAL_MS = 0.0
+_PROF_SYNCED_MS = 0.0
+_PROF_SYNCED_FRAMES = 0
+
+
+def _prof_disabled(reason: str) -> None:
+    """Turn the profiling off for the rest of the process, once."""
+    global _PROF_WARNED
+    if _PROF_WARNED:
+        return
+    _PROF_WARNED = True
+    try:
+        logger.warning("[kstep-prof] disabled after failure: %s", reason)
+    except Exception:
+        pass
+    os.environ[_PROF_ENV] = "0"
+
+
+def _prof_step_begin(frames: int) -> "_StepProf | None":
+    """``None`` when off -- and then ``run()`` takes no timer at all."""
+    try:
+        if not prof_enabled():
+            return None
+        return _StepProf(frames, detail=_PROF_STEPS < _prof_steps())
+    except Exception:
+        _prof_disabled("step_begin")
+        return None
+
+
+def _prof_frame(prof: "_StepProf", frame: int, t0: float, t1: float, t2: float, t3: float) -> None:
+    """Book one replay. ``replay``/``after`` are enqueue times; ``synced`` is the
+    frame's real wall clock (drained after the replay), and the gap between them
+    is the device side of the account."""
+    try:
+        global _PROF_SYNCED_MS, _PROF_SYNCED_FRAMES
+        replay_ms = (t1 - t0) * 1000.0
+        after_ms = (t2 - t1) * 1000.0
+        prof.replay_ms += replay_ms
+        prof.after_ms += after_ms
+        synced_ms = -1.0
+        if prof.detail and t3:
+            synced_ms = (t3 - t0) * 1000.0
+            _PROF_SYNCED_MS += synced_ms
+            _PROF_SYNCED_FRAMES += 1
+        if prof.detail:
+            _prof_frame_line(_PROF_STEPS + 1, frame, replay_ms, after_ms, synced_ms)
+    except Exception:
+        _prof_disabled("frame")
+
+
+def _prof_step_end(prof: "_StepProf | None", step_start: float) -> None:
+    if prof is None:
+        return
+    try:
+        global _PROF_STEPS, _PROF_FRAMES, _PROF_REPLAY_MS, _PROF_AFTER_MS, _PROF_TOTAL_MS
+        _PROF_STEPS += 1
+        _PROF_FRAMES += prof.frames
+        _PROF_REPLAY_MS += prof.replay_ms
+        _PROF_AFTER_MS += prof.after_ms
+        _PROF_TOTAL_MS += (perf_counter() - step_start) * 1000.0
+        if prof.detail or _PROF_STEPS % _prof_every() == 0:
+            _prof_summary(_PROF_STEPS, _PROF_FRAMES, prof.frames, detail=prof.detail)
+    except Exception:
+        _prof_disabled("step_end")
 _LOGGED_BLOCK: str | None = None
 _LOGGED_NARROW = False
 _LOGGED_NARROW_BLOCK: str | None = None
@@ -402,6 +592,9 @@ def run(
     spans = model_kwargs_extra["request_token_spans"]
     infos = model_kwargs_extra["model_intermediate_buffer"]
 
+    step_prof = _prof_step_begin(frames)
+    step_start = perf_counter() if step_prof is not None else 0.0
+
     frame_outputs = []
     frame_stop_logits = []
     frame_hidden = []
@@ -420,8 +613,16 @@ def run(
                 )
         elif frame > 0:
             _write_frame_embeddings(model, inputs_embeds, input_ids, spans, infos, frame)
+        t0 = perf_counter() if step_prof is not None else 0.0
         hidden = run_model()
+        t1 = perf_counter() if step_prof is not None else 0.0
         after_forward()
+        t2 = perf_counter() if step_prof is not None else 0.0
+        if step_prof is not None and step_prof.detail:
+            _prof_sync()
+        t3 = perf_counter() if step_prof is not None else 0.0
+        if step_prof is not None:
+            _prof_frame(step_prof, frame, t0, t1, t2, t3)
         frame_kwargs = dict(model_kwargs_extra)
         frame_kwargs["request_token_spans"] = (
             list(narrow.spans)
@@ -454,6 +655,9 @@ def run(
                 -1, frame_hidden[0].shape[-1]
             )
         )
+    # Whole step, frames + merge: this is the number to compare against the
+    # scheduler's step cadence.
+    _prof_step_end(step_prof, step_start)
     return merged
 
 
