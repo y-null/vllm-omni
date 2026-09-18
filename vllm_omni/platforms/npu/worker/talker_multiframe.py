@@ -71,6 +71,45 @@ _LOGGED_NARROW_BLOCK: str | None = None
 
 _NARROW_ENV = "VLLM_OMNI_MINICPMO_NARROW_REPLAY"
 _NARROW_OFF = frozenset({"0", "off", "false", "no"})
+_NARROW_ON = frozenset({"1", "on", "true", "yes"})
+# SoC families whose one-query capture is known to fault. The 910_93 part
+# trips a vector-core error (acl 507035) inside the packaged codec operator
+# while that graph is being captured, so the narrow path stays off there
+# unless an operator opts in explicitly -- see narrow_replay_enabled.
+_NARROW_BLOCKED_SOC_PREFIXES = ("ascend910_93",)
+
+
+def _narrow_soc_allows() -> bool:
+    """Whether this part may capture the one-query graph by default.
+
+    An explicit ``VLLM_OMNI_MINICPMO_NARROW_REPLAY=1/on`` always wins, and an
+    explicit ``0/off`` always loses. With no setting the answer depends on the
+    part: the environment is consulted first (the same variables the deploy
+    config reads, so both sides agree), and the device name is the fallback for
+    a worker launched without them.
+    """
+    raw = os.environ.get(_NARROW_ENV, "").strip().lower()
+    if raw in _NARROW_ON:
+        return True
+    if raw in _NARROW_OFF:
+        return False
+
+    name = ""
+    for variable in ("VLLM_OMNI_A14_SOC", "SOC_VERSION", "ASCEND_SOC_VERSION"):
+        value = os.environ.get(variable, "").strip().lower()
+        if value:
+            name = value
+            break
+    if not name:
+        try:
+            import torch_npu
+
+            name = str(torch_npu.npu.get_device_name(torch_npu.npu.current_device())).lower()
+        except Exception:
+            name = ""
+    if not name:
+        return True
+    return not name.startswith(_NARROW_BLOCKED_SOC_PREFIXES)
 
 
 def _log_block_once(reason: str) -> None:
@@ -200,9 +239,11 @@ def narrow_replay_enabled(runner: Any) -> bool:
     """Whether this worker should capture and replay the one-query graph.
 
     Off with ``VLLM_OMNI_MINICPMO_NARROW_REPLAY=off``, which restores the
-    K-query captures and the wide replay.
+    K-query captures and the wide replay. On a part whose one-query capture is
+    known to fault (``_NARROW_BLOCKED_SOC_PREFIXES``) it is off as well unless
+    explicitly enabled, so the capture can never brick a deployment.
     """
-    if os.environ.get(_NARROW_ENV, "").strip().lower() in _NARROW_OFF:
+    if not _narrow_soc_allows():
         return False
     model = getattr(runner, "model", None)
     if not getattr(model, "supports_multi_frame_decode", False):
