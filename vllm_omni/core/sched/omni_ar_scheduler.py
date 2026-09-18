@@ -307,18 +307,21 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         """
         cache = getattr(self, "_omni_talker_kstep_cache", None)
         if cache is None:
+            # vLLM's Scheduler does not expose speculative_config as an
+            # attribute and SchedulerConfig has no num_speculative_tokens
+            # either, so the canonical engine-side source is vllm_config.
+            # Reading anything else silently yields 0 drafts and this whole
+            # guard never arms -- exactly the bug that survived the 11:47
+            # crash fix.
             spec = getattr(self, "speculative_config", None)
+            if spec is None:
+                vllm_cfg = getattr(self, "vllm_config", None)
+                spec = getattr(vllm_cfg, "speculative_config", None) if vllm_cfg is not None else None
             num_spec = 0
             is_ngram = True
             if spec is not None:
                 num_spec = getattr(spec, "num_speculative_tokens", 0) or 0
                 is_ngram = getattr(spec, "method", "ngram") == "ngram"
-            else:
-                # Older upstream trees only expose the count through the
-                # scheduler config; it is a long-standing standard field.
-                sched_cfg = getattr(self, "scheduler_config", None)
-                if sched_cfg is not None:
-                    num_spec = getattr(sched_cfg, "num_speculative_tokens", 0) or 0
             try:
                 frames = int(os.environ.get(self._TALKER_FRAMES_ENV, "8") or 8)
             except ValueError:
@@ -327,40 +330,103 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             cache = self._omni_talker_kstep_cache = armed
         return cache
 
-    def _drop_talker_drafts_if_prefill_pending(self) -> None:
-        """Keep the Talker's K-frame decode out of mixed prefill+decode steps.
+    def _log_kstep_guard_view(self, verdict: str, widths: set[int], states: list, dropped: int = 0) -> None:
+        """Diagnostic view of what the K-step guard judged this step.
 
-        Upstream happily batches a fresh (chunked) prefill with speculative
-        decodes, but the Talker multi-frame loop requires uniform decode
-        spans and the runner refuses mixed steps (better a crash than a
-        silently wrong codec stream). Rather than dying there, drop the
-        continuation drafts for this round: every decode row schedules a
-        single token, the step takes the single-frame path, and the next
-        propose re-arms the K frames. Continuation drafts are stateless, so
-        dropping them is free; the cost is one 1-frame step per step that
-        has prefill work pending.
+        Rate-limited but never silenced on the interesting steps: the 12:39
+        crash landed on a step whose one-shot guard log had already been
+        consumed, which hid exactly the state the guard passed. Diagnostics
+        must never raise either -- this one must not kill the engine.
+        """
+        count = getattr(self, "_omni_kstep_guard_view_count", 0) + 1
+        self._omni_kstep_guard_view_count = count
+        if count > 20 and count % 50 != 0:
+            return
+        try:
+            logger.info(
+                "[K-guard] #%d %s: waiting=%d widths=%s dropped=%d "
+                "states=(id, computed, prompt_len, total, spec_len, delta)=%s",
+                count,
+                verdict,
+                len(self.waiting),
+                sorted(widths),
+                dropped,
+                states,
+            )
+        except Exception as exc:  # never let the diagnostic kill the engine
+            logger.info("[K-guard] #%d %s (view failed: %r)", count, verdict, exc)
+
+    def _drop_talker_drafts_if_prefill_pending(self) -> None:
+        """Keep the Talker's K-frame decode out of steps with uneven spans.
+
+        The Talker multi-frame loop requires uniform decode spans, and the
+        runner refuses anything else (better a crash than a silently wrong
+        codec stream). What matters is the number of rows vLLM is about to
+        schedule per request -- not the request's spec_token_ids length:
+
+        * a plain decode is scheduled ``1 + num_spec_tokens`` rows (the
+          continuation placeholders, re-armed every step);
+        * a request carrying a streaming (or chunked) input chunk keeps its
+          own token count, e.g. 7 rows for a 7-token chunk;
+        * a decode that cannot fit the padded width (near max_model_len)
+          falls back to a single row.
+
+        Any mix of those in one step produces non-uniform spans, even in a
+        pure decode batch with no prefill in sight. Rather than dying at
+        the runner, drop the continuation drafts for this round: every
+        decode row schedules a single token next step, the step takes the
+        single-frame path, and the next propose re-arms the K frames.
+        Continuation drafts are stateless, so dropping them is free.
         """
         if not self._talker_kstep_armed():
             return
-        if not self.waiting:
-            for req in self.running:
-                if req.num_computed_tokens < len(req.prompt_token_ids):
-                    break
+        num_spec = int(getattr(self, "num_spec_tokens", 0) or 0)
+        max_len = getattr(self, "max_model_len", None)
+        try:
+            max_len = int(max_len) if max_len is not None else None
+        except (TypeError, ValueError):
+            max_len = None
+        prefill_pending = bool(self.waiting)
+        widths: set[int] = set()
+        states: list = []
+        for req in self.running:
+            computed = int(req.num_computed_tokens)
+            prompt_len = len(req.prompt_token_ids)
+            total = int(getattr(req, "num_tokens", prompt_len))
+            delta = total - computed
+            spec_len = len(req.spec_token_ids or [])
+            states.append(
+                (str(getattr(req, "request_id", "?"))[:12], computed, prompt_len, total, spec_len, delta)
+            )
+            if computed < prompt_len:
+                prefill_pending = True
+                continue
+            if delta <= 0:
+                # Nothing scheduled for this request; it owns no rows.
+                continue
+            if delta == 1:
+                can_pad = max_len is None or computed + 1 + num_spec + 1 <= max_len
+                widths.add(1 + num_spec if (num_spec > 0 and can_pad) else 1)
             else:
-                return
+                widths.add(delta)
+        uneven = len(widths) > 1
+        if not prefill_pending and not uneven:
+            if not widths and states:
+                # Running requests exist but none yields a row width: the step
+                # schedules no decode rows at all. Rare enough to be interesting.
+                self._log_kstep_guard_view("pass-no-decode-widths", widths, states)
+            return
         dropped = 0
         for req in self.running:
             if req.spec_token_ids:
                 req.spec_token_ids = []
                 dropped += 1
-        if dropped and not getattr(self, "_omni_kstep_guard_logged", False):
-            self._omni_kstep_guard_logged = True
-            logger.info(
-                "K-frame guard: prefill work is pending, deferring the "
-                "Talker K-step drafts for this step (%d request(s) drop to "
-                "single-frame; drafts re-arm on the next propose)",
-                dropped,
-            )
+        self._log_kstep_guard_view(
+            f"drop ({'prefill pending' if prefill_pending else 'uneven spans'})",
+            widths,
+            states,
+            dropped=dropped,
+        )
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         # Remove FINISHED_ABORTED requests before the upstream scheduler sees
@@ -372,9 +438,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._process_pending_omni_inputs(model_mode="ar")
         self._drop_aborted_queued_requests()
         self._resync_streaming_input_counter()
-        # Talker K-frame guard: a step that also carries (chunked) prefill
-        # rows must not carry the K-step drafts -- the multi-frame loop
-        # requires uniform decode spans and the runner refuses mixed steps.
+        # Talker K-frame guard: a step whose decode spans would be uneven
+        # (mixed prefill+decode rows, or a first-step decode joining a
+        # steady-state K-step request) must not carry the K-step drafts --
+        # the multi-frame loop requires uniform decode spans and the runner
+        # refuses the rest.
         self._drop_talker_drafts_if_prefill_pending()
 
         original_waiting = None
