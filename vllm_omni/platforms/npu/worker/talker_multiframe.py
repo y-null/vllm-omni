@@ -76,7 +76,11 @@ _NARROW_ON = frozenset({"1", "on", "true", "yes"})
 # trips a vector-core error (acl 507035) inside the packaged codec operator
 # while that graph is being captured, so the narrow path stays off there
 # unless an operator opts in explicitly -- see narrow_replay_enabled.
-_NARROW_BLOCKED_SOC_PREFIXES = ("ascend910_93",)
+# "ascend910c" guards the device-name fallback: on some A3 containers the
+# driver reports the part as "Ascend910C" rather than its 910_93 SoC code,
+# and an unblocked unknown would let the capture brick the deployment.
+_NARROW_BLOCKED_SOC_PREFIXES = ("ascend910_93", "ascend910c")
+_NARROW_SOC_LOGGED: str | None = None
 
 
 def _narrow_soc_allows() -> bool:
@@ -88,6 +92,8 @@ def _narrow_soc_allows() -> bool:
     config reads, so both sides agree), and the device name is the fallback for
     a worker launched without them.
     """
+    global _NARROW_SOC_LOGGED
+
     raw = os.environ.get(_NARROW_ENV, "").strip().lower()
     if raw in _NARROW_ON:
         return True
@@ -107,9 +113,15 @@ def _narrow_soc_allows() -> bool:
             name = str(torch_npu.npu.get_device_name(torch_npu.npu.current_device())).lower()
         except Exception:
             name = ""
-    if not name:
-        return True
-    return not name.startswith(_NARROW_BLOCKED_SOC_PREFIXES)
+    allows = True if not name else not name.startswith(_NARROW_BLOCKED_SOC_PREFIXES)
+    if _NARROW_SOC_LOGGED != name:
+        _NARROW_SOC_LOGGED = name
+        logger.info(
+            "[minicpmo] narrow replay SoC gate: name='%s' -> %s",
+            name or "<unidentified>",
+            "allowed" if allows else "blocked",
+        )
+    return allows
 
 
 def _log_block_once(reason: str) -> None:
