@@ -23,6 +23,7 @@ from vllm_ascend.worker.model_runner_v1 import SEQ_LEN_WITH_MAX_PA_WORKSPACE
 from vllm_omni.core.prefix_cache import OmniTensorPrefixCache
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms.npu._310p import is_310p
+from vllm_omni.platforms.npu.native_rejection_sampler import restore_native_rejection_sampler
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 
 logger = init_logger(__name__)
@@ -72,6 +73,11 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
 
             apply_model_patches(self.model_config)
         NPUModelRunner.load_model(self, *args, **kwargs)
+        # Before the first request verifies a draft: on 910_93 the patched
+        # Triton rejection kernels fault their warmup (skipped) and would be
+        # JIT-compiled mid-request otherwise, stalling every stage. See
+        # native_rejection_sampler for the chain.
+        restore_native_rejection_sampler()
         # Initialize enable_sp cache to avoid get_current_vllm_config() error
         # in _pad_for_sequence_parallelism during execute_model.
         # This is a workaround for vllm-ascend not passing vllm_config to enable_sp().
