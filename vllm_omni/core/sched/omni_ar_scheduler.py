@@ -410,6 +410,22 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         stopped_running_reqs: set[Request] = set()
         stopped_preempted_reqs: set[Request] = set()
         for req_id, num_tokens_scheduled in num_scheduled_tokens.items():
+            if num_tokens_scheduled <= 0:
+                # P17 SCHED0 diagnostic: a zero-token schedule entry used to
+                # die on the bare assert below with no context, which is what
+                # made the K-step stall so expensive to scope. Report WHICH
+                # request and in what state first; the assert still fires.
+                _r = self.requests.get(req_id)
+                _spec = scheduler_output.scheduled_spec_decode_tokens.get(req_id)
+                logger.error(
+                    "SCHED0 zero-token schedule: req=%s n=%s spec_tokens=%s status=%s "
+                    "num_computed=%s num_output_placeholders=%s finished=%s all_entries=%s",
+                    req_id, num_tokens_scheduled, _spec,
+                    getattr(_r, "status", None), getattr(_r, "num_computed_tokens", None),
+                    getattr(_r, "num_output_placeholders", None),
+                    None if _r is None else _r.is_finished(),
+                    dict(list(num_scheduled_tokens.items())[:8]),
+                )
             assert num_tokens_scheduled > 0
             request = self.requests.get(req_id)
             if request is not None:
@@ -503,6 +519,21 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
                     request_id=req_id,
                 )
+            elif sampled_token_ids:
+                # P17 layer C: this request had drafts scheduled but its row
+                # came back with no generated tokens while the step itself
+                # sampled (a logprob-contract failure emptied the row above,
+                # the rejection sampler dropped every token, ...). The D draft
+                # tokens were counted as computed but none of them will ever
+                # produce output, so roll all D back -- otherwise the next
+                # step schedules a negative count and the engine stalls.
+                # The rollback is D, not upstream's D + 1: a prefill step
+                # scheduled chunk_len + D and consumed chunk_len.
+                _drafts = len(scheduled_spec_token_ids)
+                if request.num_computed_tokens >= _drafts:
+                    request.num_computed_tokens -= _drafts
+                if request.num_output_placeholders >= _drafts:
+                    request.num_output_placeholders -= _drafts
 
             # Free encoder inputs only after the step has actually executed.
             if request.has_encoder_inputs:
@@ -795,7 +826,14 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             session.async_tokens_to_discard = 1
             session.num_computed_tokens -= session.num_output_placeholders
             session.num_output_placeholders = 0
-            session.spec_token_ids = []
+        # P17 layer B: clear stale drafts unconditionally, not only under
+        # async scheduling. With async off -- which the K-step vehicle
+        # requires -- a draft proposed before the segment boundary survived
+        # into the next segment's prefill; the runner discards prefill rows
+        # that are not the final chunk, so that row produced no token
+        # forever and the request either tripped a negative num_new_tokens
+        # or livelocked until it timed out.
+        session.spec_token_ids = []
         stage_id = self.vllm_config.model_config.stage_id
 
         update_infos = (

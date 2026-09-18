@@ -529,6 +529,18 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
                 )
             finally:
                 talker_multiframe.end_narrow_step(forward_context, narrow)
+            # Restore the vocab gate the ed8c7db8 refactor dropped along with
+            # the _model_forward override it lived in. The Talker's vLLM-level
+            # head is the two-wide continue/stop row, but input_batch reports
+            # vocab_size=0, and the rejection sampler's parse_output then masks
+            # every accepted token as out-of-vocab: the request comes back with
+            # nothing, the scheduler never rolls back the K tokens it advanced,
+            # and the next steps schedule a negative count -- the engine hangs
+            # right after the first 'engaged' step. Single-frame steps never
+            # took the branch that reads vocab_size; only the K-step does.
+            talker_multiframe.ensure_stop_token_vocab(
+                self, model_output.text_hidden_states
+            )
             self._omni_last_model_output = model_output
             return model_output
 
