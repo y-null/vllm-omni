@@ -282,16 +282,28 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 # Dump the rows as they were seen. An all-empty batch here is
                 # the stall signature: name WHICH request and what shape the
                 # step returned instead of leaving one log line to reason from.
-                rows = list(valid_sampled_token_ids or [])
+                # Type-safe throughout: the padded-drafter branch passes a
+                # tensor, and `tensor or []` raises the ambiguous-truth error.
+                if isinstance(valid_sampled_token_ids, list):
+                    rows = valid_sampled_token_ids
+                    _desc = "rows=%s types=%s lens=%s head=%s" % (
+                        len(rows),
+                        [type(r).__name__ for r in rows[:8]],
+                        [len(r) for r in rows[:8] if isinstance(r, list)],
+                        repr(rows)[:400],
+                    )
+                else:
+                    seen = valid_sampled_token_ids
+                    shape = tuple(seen.shape) if hasattr(seen, "shape") else "?"
+                    _desc = "rows=<%s shape=%s>" % (
+                        type(seen).__name__,
+                        shape,
+                    )
                 logger.error(
-                    "[kstep] no drafts emitted: frames=%s num_reqs=%s rows=%s "
-                    "row_types=%s row_lens=%s head=%s",
+                    "[kstep] no drafts emitted: frames=%s num_reqs=%s %s",
                     frames,
                     self.input_batch.num_reqs,
-                    len(rows),
-                    [type(r).__name__ for r in rows[:8]],
-                    [len(r) for r in rows[:8] if isinstance(r, list)],
-                    repr(rows)[:400],
+                    _desc,
                 )
             return drafts
         drafts = super().propose_draft_token_ids(valid_sampled_token_ids, *args, **kwargs)

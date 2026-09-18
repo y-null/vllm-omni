@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from collections import defaultdict
 from collections.abc import Iterable, Iterator
@@ -291,6 +292,76 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if stop_after_transfer and req_id in self.requests_needing_kv_transfer:
             self.pending_stop_after_extraction.add(req_id)
 
+    # Env var shared with stage_config._apply_minicpmo_talker_multiframe_default;
+    # keep the name in sync there.
+    _TALKER_FRAMES_ENV = "VLLM_OMNI_MINICPMO_TALKER_FRAMES"
+
+    def _talker_kstep_armed(self) -> bool:
+        """True when this scheduler drives the Talker K-frame decode.
+
+        Mirrors `_apply_minicpmo_talker_multiframe_default`: the Talker stage
+        gets an injected n-gram config with exactly frames-1 draft tokens.
+        Matching that fingerprint keeps both sides reading the same env var.
+        The text stage's explicit n-gram config (15 draft tokens by default)
+        does not match, so this stays a no-op there.
+        """
+        cache = getattr(self, "_omni_talker_kstep_cache", None)
+        if cache is None:
+            spec = getattr(self, "speculative_config", None)
+            num_spec = 0
+            is_ngram = True
+            if spec is not None:
+                num_spec = getattr(spec, "num_speculative_tokens", 0) or 0
+                is_ngram = getattr(spec, "method", "ngram") == "ngram"
+            else:
+                # Older upstream trees only expose the count through the
+                # scheduler config; it is a long-standing standard field.
+                sched_cfg = getattr(self, "scheduler_config", None)
+                if sched_cfg is not None:
+                    num_spec = getattr(sched_cfg, "num_speculative_tokens", 0) or 0
+            try:
+                frames = int(os.environ.get(self._TALKER_FRAMES_ENV, "8") or 8)
+            except ValueError:
+                frames = 8
+            armed = is_ngram and frames > 1 and num_spec == frames - 1
+            cache = self._omni_talker_kstep_cache = armed
+        return cache
+
+    def _drop_talker_drafts_if_prefill_pending(self) -> None:
+        """Keep the Talker's K-frame decode out of mixed prefill+decode steps.
+
+        Upstream happily batches a fresh (chunked) prefill with speculative
+        decodes, but the Talker multi-frame loop requires uniform decode
+        spans and the runner refuses mixed steps (better a crash than a
+        silently wrong codec stream). Rather than dying there, drop the
+        continuation drafts for this round: every decode row schedules a
+        single token, the step takes the single-frame path, and the next
+        propose re-arms the K frames. Continuation drafts are stateless, so
+        dropping them is free; the cost is one 1-frame step per step that
+        has prefill work pending.
+        """
+        if not self._talker_kstep_armed():
+            return
+        if not self.waiting:
+            for req in self.running:
+                if req.num_computed_tokens < len(req.prompt_token_ids):
+                    break
+            else:
+                return
+        dropped = 0
+        for req in self.running:
+            if req.spec_token_ids:
+                req.spec_token_ids = []
+                dropped += 1
+        if dropped and not getattr(self, "_omni_kstep_guard_logged", False):
+            self._omni_kstep_guard_logged = True
+            logger.info(
+                "K-frame guard: prefill work is pending, deferring the "
+                "Talker K-step drafts for this step (%d request(s) drop to "
+                "single-frame; drafts re-arm on the next propose)",
+                dropped,
+            )
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         # Remove FINISHED_ABORTED requests before the upstream scheduler sees
         # them. Upstream vllm raises RuntimeError on this status; omni allows
@@ -301,6 +372,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._process_pending_omni_inputs(model_mode="ar")
         self._drop_aborted_queued_requests()
         self._resync_streaming_input_counter()
+        # Talker K-frame guard: a step that also carries (chunked) prefill
+        # rows must not carry the K-step drafts -- the multi-frame loop
+        # requires uniform decode spans and the runner refuses mixed steps.
+        self._drop_talker_drafts_if_prefill_pending()
 
         original_waiting = None
         if self._should_defer_waiting_admission():
@@ -519,7 +594,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
                     request_id=req_id,
                 )
-            elif sampled_token_ids:
+            elif scheduled_spec_token_ids and sampled_token_ids:
                 # P17 layer C: this request had drafts scheduled but its row
                 # came back with no generated tokens while the step itself
                 # sampled (a logprob-contract failure emptied the row above,
@@ -527,6 +602,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # tokens were counted as computed but none of them will ever
                 # produce output, so roll them back -- otherwise the next
                 # step schedules a negative count and the engine stalls.
+                # NOTE the guard on `scheduled_spec_token_ids`: upstream takes
+                # it from `.get(req_id)` and a request with no drafts this
+                # step gets None -- an empty row without drafts is normal
+                # (a non-final prefill chunk produces no tokens) and upstream
+                # skips it; the guard above keeps that path intact.
                 # A prefill-chunk row is different: the chunk's prompt tokens
                 # did land in the KV cache, so only the D drafts roll back
                 # (the case entry_02 measured; the base token stays advanced).
