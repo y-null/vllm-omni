@@ -17,23 +17,33 @@ The torch-native implementation the patch replaces is pure tensor ops and
 exact for both callers, so this module reloads vllm's own sampler source
 into a fresh module object and re-points the three names at the pre-patch
 functions. Scoped to the same SoC that skips the warmup; the 910B baseline
-keeps the Triton kernels it has been measured with.
+keeps the Triton kernels it has been measured with -- except when the Talker
+K-step is explicitly armed there. That is the one path whose spec width the
+910B kernels cannot take (aivec 507035 on every one of the 8 combos tried),
+so the restore on a 910B is tied to exactly that arming, never to the SoC
+alone: the stock baseline (no arming env) keeps its sampler byte-for-byte.
 """
 
 import importlib.util
 import logging
 
-from vllm_omni.platforms.npu.ascend_warmup_patch import _probe_soc_name
+from vllm_omni.platforms.npu.ascend_warmup_patch import _kstep_armed, _probe_soc_name
 
 logger = logging.getLogger(__name__)
 
 _RESTORED = False
 _RESTORE_SOC_PREFIXES = ("ascend910_93", "ascend910c")
+# See the module docstring: on these parts the restore applies only when the
+# K-step is explicitly armed, because their stock baseline runs the patched
+# kernels fine at the widths it was measured with.
+_KSTEP_SOC_PREFIXES = ("ascend910b",)
 
 
 def _target_soc() -> bool:
     name = _probe_soc_name().strip().lower()
-    return any(name.startswith(prefix) for prefix in _RESTORE_SOC_PREFIXES)
+    if any(name.startswith(prefix) for prefix in _RESTORE_SOC_PREFIXES):
+        return True
+    return any(name.startswith(prefix) for prefix in _KSTEP_SOC_PREFIXES) and _kstep_armed()
 
 
 def restore_native_rejection_sampler() -> None:

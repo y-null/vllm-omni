@@ -79,7 +79,10 @@ _NARROW_ON = frozenset({"1", "on", "true", "yes"})
 # "ascend910c" guards the device-name fallback: on some A3 containers the
 # driver reports the part as "Ascend910C" rather than its 910_93 SoC code,
 # and an unblocked unknown would let the capture brick the deployment.
-_NARROW_BLOCKED_SOC_PREFIXES = ("ascend910_93", "ascend910c")
+# "ascend910b" is fail-safe rather than observed: no K-step attempt there
+# ever reached a capture (all 8 combos faulted earlier, inside the reject
+# kernel), so the one-query capture is unverified on that family.
+_NARROW_BLOCKED_SOC_PREFIXES = ("ascend910_93", "ascend910c", "ascend910b")
 _NARROW_SOC_LOGGED: str | None = None
 
 

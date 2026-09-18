@@ -82,6 +82,21 @@ def _probe_soc_name() -> str:
         return ""
 
 
+def _kstep_armed() -> bool:
+    """Whether the Talker K-step is explicitly armed (frames > 1).
+
+    Single source of truth is the same env the deploy config reads; a loader
+    that cannot import it is treated as "not armed" so the baseline never
+    changes by accident.
+    """
+    try:
+        from vllm_omni.config.stage_config import talker_frames_per_step
+
+        return talker_frames_per_step() > 1
+    except Exception:
+        return False
+
+
 def _skipped_names() -> set[str]:
     raw = os.environ.get(_ENV, "").strip().lower()
     if raw:
@@ -90,6 +105,11 @@ def _skipped_names() -> set[str]:
         return {part.strip() for part in raw.split(",") if part.strip()}
     soc = _probe_soc_name()
     if soc.startswith("Ascend910B"):
+        if _kstep_armed():
+            # The torch-native sampler replaces the reject kernels whenever
+            # the K-step is armed, so this warmup would only compile kernels
+            # nobody runs. Everything else keeps the stock warmup.
+            return {"rejection_sampler"}
         # Verified clean here; keep the stock warmup untouched.
         return set()
     return set(_DEFAULT_SKIP)
