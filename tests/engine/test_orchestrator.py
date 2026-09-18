@@ -2778,3 +2778,211 @@ async def test_request_cleanup_failure_is_deferred_to_control_plane():
 
     assert orchestrator.duplex_control_plane.deferred == ["sid-cleanup"]
     assert orchestrator.duplex_control_plane.finalized == []
+
+
+# ---------------------------------------------------------------------------
+# Cross-stage spec-decoding per-position width (the 7e949d8e crash).
+#
+# _OmniSpecDecodingProm is built from ONE stage's vllm_config, so its per-pos
+# counter list is as wide as that stage's num_speculative_tokens (stage0 ngram
+# = 15) and every stage feeds that same logger. The Talker K-step carries its
+# own 7-draft config, so its first SpecDecodingStats carried a 7-wide
+# num_accepted_tokens_per_pos while upstream observe() iterates the logger's 15
+# counters:
+#
+#     for pos, counter in enumerate(counters_for_engine):
+#         counter.inc(spec_decoding_stats.num_accepted_tokens_per_pos[pos])
+#
+# IndexError inside the orchestrator thread -> EngineDeadError -> every stage
+# torn down. Orchestrator._pad_spec_positions (zero-pad to the widest stage)
+# plus the wrapping try/except around record() are the fix; both are pinned
+# here so a future refactor cannot silently reintroduce a fatal metrics path.
+# ---------------------------------------------------------------------------
+
+
+def _pool_with_spec(num_spec: int) -> SimpleNamespace:
+    """Fake StagePool carrying only what _max_spec_positions reads."""
+    return SimpleNamespace(
+        stage_vllm_config=SimpleNamespace(
+            speculative_config=SimpleNamespace(num_speculative_tokens=num_spec)
+        )
+    )
+
+
+def _spec_stats(width: int, accepted: int = 1) -> SimpleNamespace:
+    """Stand-in for vllm's SpecDecodingStats (fields observe() consumes)."""
+    per_pos = [0] * width
+    for pos in range(min(accepted, width)):
+        per_pos[pos] = 1
+    return SimpleNamespace(
+        num_spec_tokens=width,
+        num_drafts=1,
+        num_draft_tokens=width,
+        num_accepted_tokens=accepted,
+        num_accepted_tokens_per_pos=per_pos,
+    )
+
+
+def _scheduler_stats(spec: SimpleNamespace) -> SimpleNamespace:
+    return SimpleNamespace(num_waiting_reqs=0, spec_decoding_stats=spec)
+
+
+def _replay_upstream_prom_observe(stats: Any, logger_num_spec: int) -> list[int]:
+    """Mirror SpecDecodingProm.observe's per-pos loop verbatim.
+
+    The loop length is the *logger's* draft count, not the stats' width — that
+    asymmetry is exactly what raised IndexError at vllm/v1/spec_decode/metrics.py.
+    """
+    counters = [0] * logger_num_spec
+    for pos, counter in enumerate(counters):
+        counters[pos] = counter + stats.num_accepted_tokens_per_pos[pos]
+    return counters
+
+
+class TestSpecPerPosWidthAcrossStages:
+    """Stage-0 ngram (15 drafts) logger vs Talker K-step (7 drafts) stats."""
+
+    def test_shorter_stage_stats_index_errors_without_padding(self):
+        # Reproduces 7e949d8e: 15-draft logger, 7-draft stage stats.
+        stats = _spec_stats(7)
+        with pytest.raises(IndexError):
+            _replay_upstream_prom_observe(stats, 15)
+
+    def test_pad_width_covers_logger_width_in_either_pool_order(self):
+        # The logger is built from the first pool carrying a config; the pad
+        # width must cover that pool whichever order the pools come in.
+        orchestrator = object.__new__(Orchestrator)
+        for pools in (
+            [_pool_with_spec(15), _pool_with_spec(7)],
+            [_pool_with_spec(7), _pool_with_spec(15)],
+        ):
+            orchestrator._spec_pos_pad_to = orchestrator._max_spec_positions(pools)
+            assert orchestrator._spec_pos_pad_to >= 15
+            for pool in pools:
+                width = pool.stage_vllm_config.speculative_config.num_speculative_tokens
+                stats = _spec_stats(width)
+                orchestrator._pad_spec_positions(_scheduler_stats(stats))
+                # No IndexError, and the replay consumed the logger's 15 slots.
+                counters = _replay_upstream_prom_observe(stats, 15)
+                assert len(counters) == 15
+
+    def test_padded_positions_are_zero_and_do_not_invent_accepts(self):
+        orchestrator = object.__new__(Orchestrator)
+        orchestrator._spec_pos_pad_to = orchestrator._max_spec_positions(
+            [_pool_with_spec(15), _pool_with_spec(7)]
+        )
+        stats = _spec_stats(7, accepted=7)
+        orchestrator._pad_spec_positions(_scheduler_stats(stats))
+
+        assert len(stats.num_accepted_tokens_per_pos) == orchestrator._spec_pos_pad_to
+        counters = _replay_upstream_prom_observe(stats, 15)
+        # Positions 0..6 keep the real accepts, 7..14 are drafts this stage
+        # does not have and never accept.
+        assert counters[:7] == [1] * 7
+        assert counters[7:] == [0] * 8
+
+    def test_max_spec_positions_tolerates_missing_configs(self):
+        orchestrator = object.__new__(Orchestrator)
+        assert orchestrator._max_spec_positions([]) == 0
+        assert orchestrator._max_spec_positions([SimpleNamespace()]) == 0
+        assert orchestrator._max_spec_positions([SimpleNamespace(stage_vllm_config=None)]) == 0
+        assert (
+            orchestrator._max_spec_positions(
+                [SimpleNamespace(stage_vllm_config=SimpleNamespace(speculative_config=None))]
+            )
+            == 0
+        )
+
+    def test_pad_spec_positions_never_raises_on_odd_shapes(self):
+        # Diagnostics must never be the thing that kills the engine.
+        orchestrator = object.__new__(Orchestrator)
+        orchestrator._spec_pos_pad_to = 16
+
+        wide = _spec_stats(20)
+        orchestrator._pad_spec_positions(_scheduler_stats(wide))
+        assert len(wide.num_accepted_tokens_per_pos) == 20  # longer list untouched
+
+        orchestrator._pad_spec_positions(None)
+        orchestrator._pad_spec_positions(SimpleNamespace())
+        orchestrator._pad_spec_positions(
+            SimpleNamespace(spec_decoding_stats=SimpleNamespace(num_accepted_tokens_per_pos=None))
+        )
+        orchestrator._pad_spec_positions(
+            SimpleNamespace(spec_decoding_stats=SimpleNamespace(num_accepted_tokens_per_pos=(0, 1)))
+        )
+
+        orchestrator._spec_pos_pad_to = 0  # padding disabled
+        short = _spec_stats(7)
+        orchestrator._pad_spec_positions(_scheduler_stats(short))
+        assert len(short.num_accepted_tokens_per_pos) == 7
+
+
+@pytest.mark.asyncio
+async def test_process_llm_stage_outputs_pads_before_record():
+    """The real poll path pads the short stage's list before record()."""
+
+    class _SpecLogger:
+        """Replays upstream's per-pos loop over the logger's own 15 counters."""
+
+        def __init__(self) -> None:
+            self.calls = 0
+            self.error: Exception | None = None
+
+        def record(self, scheduler_stats, iteration_stats, engine_idx=0):
+            self.calls += 1
+            per_pos = scheduler_stats.spec_decoding_stats.num_accepted_tokens_per_pos
+            try:
+                for pos in range(15):
+                    per_pos[pos]
+            except IndexError as exc:  # would be swallowed by the caller's guard
+                self.error = exc
+
+    class _Pool:
+        async def process_llm_raw_outputs(self, replica_id, raw_outputs, iteration_stats=None):
+            return ["processed"]
+
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator.stage_pools = [_Pool()]
+    orchestrator.async_chunk = True  # _handle_kv_ready_raw_outputs early-returns
+    orchestrator.request_states = {}
+    orchestrator._prom_metrics = None
+    orchestrator._stat_logger = _SpecLogger()
+    orchestrator._spec_pos_pad_to = orchestrator._max_spec_positions(
+        [_pool_with_spec(15), _pool_with_spec(7)]
+    )
+    orchestrator._stage_replica_to_engine_idx = {(0, 0): 0}
+
+    raw_outputs = SimpleNamespace(outputs=[], scheduler_stats=_scheduler_stats(_spec_stats(7)))
+    processed = await orchestrator._process_llm_stage_outputs(0, 0, raw_outputs, set())
+
+    assert processed == ["processed"]
+    assert orchestrator._stat_logger.calls == 1
+    assert orchestrator._stat_logger.error is None
+
+
+@pytest.mark.asyncio
+async def test_stat_logger_record_failure_does_not_kill_the_poll_path():
+    """A metrics shape mismatch (now or after a vllm upgrade) degrades to a skip."""
+
+    class _BoomLogger:
+        def record(self, *args, **kwargs):
+            raise IndexError("list index out of range")
+
+    class _Pool:
+        async def process_llm_raw_outputs(self, replica_id, raw_outputs, iteration_stats=None):
+            return ["processed"]
+
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator.stage_pools = [_Pool()]
+    orchestrator.async_chunk = True
+    orchestrator.request_states = {}
+    orchestrator._prom_metrics = None
+    orchestrator._stat_logger = _BoomLogger()
+    orchestrator._spec_pos_pad_to = 16
+    orchestrator._stage_replica_to_engine_idx = {(0, 0): 0}
+
+    raw_outputs = SimpleNamespace(outputs=[], scheduler_stats=_scheduler_stats(_spec_stats(7)))
+    processed = await orchestrator._process_llm_stage_outputs(0, 0, raw_outputs, set())
+
+    # The stage output still routes; only the metric sample is dropped.
+    assert processed == ["processed"]

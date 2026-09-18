@@ -1197,6 +1197,11 @@ class Orchestrator:
         for pool in stage_pools or []:
             cfg = getattr(pool, "stage_vllm_config", None)
             spec = getattr(cfg, "speculative_config", None) if cfg is not None else None
+            if spec is None:
+                # A stage without speculative decoding (or without a built
+                # config) feeds no spec stats at all: it must not invent a
+                # width, so 0 stays the "padding disabled" sentinel.
+                continue
             num_spec = getattr(spec, "num_speculative_tokens", 0) or 0
             best = max(best, num_spec + 1)
         return best
