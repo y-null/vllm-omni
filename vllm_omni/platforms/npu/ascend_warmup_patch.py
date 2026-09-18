@@ -36,6 +36,15 @@ cannot name the SoC skips the faulting warmup: a missing warmup costs latency,
 a faulting one costs the whole run.
 ``VLLM_OMNI_NPU_SKIP_WARMUPS`` overrides the set (comma separated substrings
 of the warmup names, or "none" to restore stock behaviour).
+
+``rejection_sampler_triton_warmup`` joined the default skip set after the A3
+run of 02:38 pinned the acl 507035 aivec fault on it: the dummy
+(batch, spec_len, vocab) sweep "completed" on the host half a second before
+the pre-capture synchronize raised, and nothing else was enqueued in between
+(penalties was already skipped, rms is a no-op there). Skipping is lossless
+the same way: on this stack no 910C runtime path launches the reject_sample
+kernels -- the Talker's K-step sample() and its SoC guards fall back to
+torch argmax, so the warmup only ever compiled kernels nobody runs.
 """
 
 from __future__ import annotations
@@ -51,7 +60,7 @@ logger = init_logger(__name__)
 _PATCHED = False
 _ENV = "VLLM_OMNI_NPU_SKIP_WARMUPS"
 # Substrings matched against the warmup function names in kernel_warmup.py.
-_DEFAULT_SKIP = ("penalties",)
+_DEFAULT_SKIP = ("penalties", "rejection_sampler")
 _WARMUP_NAMES = (
     "rejection_sampler_triton_warmup",
     "penalties_triton_warmup",
@@ -97,8 +106,9 @@ def _make_guard(name: str, original: Callable[[Any], Any]) -> Callable[[Any], An
     def _guarded(worker: Any) -> Any:
         if any(fragment in name for fragment in _skipped_names()):
             logger.info(
-                "[npu] %s skipped: the legacy BroadcastTo kernel faults the "
-                "910_93 vector core during its dummy-token setup",
+                "[npu] %s skipped: these Triton warmups fault the 910_93 "
+                "vector core during their dummy-token setup (acl 507035), "
+                "and no runtime path on this stack launches the kernels",
                 name,
             )
             return None
