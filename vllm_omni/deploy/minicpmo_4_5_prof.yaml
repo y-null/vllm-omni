@@ -173,11 +173,11 @@ platforms:
           # path to FULL_AND_PIECEWISE (which T1 overrode anyway); prefill
           # runs eager either way.
           cudagraph_mode: FULL_DECODE_ONLY
-        env:
-          # step-level profiling: without these the stage worker imports
-          # step_prof.py with _ENABLED=false and every tic/toc is a no-op.
-          OMNI_STEP_PROF: "0"
-          OMNI_STEP_PROF_FLUSH: "200"
+        # Step-level profiling is opt-in and stays off unless asked for:
+        # step_prof.py already defaults to OMNI_STEP_PROF=0 (and flush every
+        # 200 spans), so pinning those values here was a no-op that only
+        # looked like configuration. Set OMNI_STEP_PROF=1 (+ optionally
+        # OMNI_STEP_PROF_FLUSH=<n>) when a profile dump is actually wanted.
       - stage_id: 2
         max_num_seqs: 8
         # Stage 2 stays outer-eager and captures only exact-shape CFM DiT
