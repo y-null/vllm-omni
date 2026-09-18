@@ -97,6 +97,16 @@ def _make_talker() -> MiniCPMO45OmniTTSForConditionalGeneration:
     nn.Module.__init__(talker)
     talker._num_audio_tokens = 8
     talker._codec_eos_id = 7
+    # Codec sampling contract introduced by the K-step series: the fixture
+    # runs the deterministic greedy boundary (argmax over head_code) and
+    # never arms the multi-frame loop.
+    talker._codec_temperature = 0.0
+    talker._codec_min_tokens = 0
+    talker._codec_max_tokens = 4032
+    talker._codec_repetition_penalty = 1.0
+    talker._codec_top_k = 0
+    talker._k_step_frames = 0
+    talker.supports_multi_frame_decode = False
     talker._force_eos_rows = None
     talker._mask_eos_rows = None
     talker._pending_force_eos_rows = None
@@ -108,6 +118,11 @@ def _make_talker() -> MiniCPMO45OmniTTSForConditionalGeneration:
     talker.head_code = nn.ModuleList([nn.Linear(2, 8, bias=False)])
     with torch.no_grad():
         talker.head_code[0].weight.copy_(torch.eye(8, 2))
+
+    def _greedy(hidden_state, _history, _request_id, _step, _min_tokens, _max_tokens):
+        return talker.head_code[0](hidden_state).float().argmax(dim=-1).reshape(())
+
+    talker._sample_audio_code_greedy = _greedy
     return talker
 
 
@@ -640,20 +655,25 @@ def test_native_duplex_prefill_records_generate_chunk_budget() -> None:
 
 
 def test_make_omni_output_packs_the_previous_codec_id() -> None:
+    # K-step contract: the connector-facing codec delta carries the frame's
+    # freshly sampled id; the previous frame's id travels through the
+    # request state (``last_code``), not through the output payload.
     talker = _make_talker()
     infos = [
         {"request_id": "req-a", "codes": {"audio": torch.tensor([[2]])}},
         {"request_id": "req-b", "codes": {"audio": torch.tensor([[3]])}},
     ]
 
+    # hidden rows hit distinct argmax slots of head_code: row 0 -> id 0,
+    # row 1 -> id 1 (eye-shaped head, only ids 0/1 dominate positive h).
     output = talker.make_omni_output(
-        torch.ones(2, 2),
+        torch.tensor([[3.0, 0.0], [0.0, 3.0]]),
         model_intermediate_buffer=infos,
         request_token_spans=[(0, 1), (1, 2)],
     )
 
-    assert _routed(output, 0)["codes"]["audio"].tolist() == [[2]]
-    assert _routed(output, 1)["codes"]["audio"].tolist() == [[3]]
+    assert _routed(output, 0)["codes"]["audio"].tolist() == [[0]]
+    assert _routed(output, 1)["codes"]["audio"].tolist() == [[1]]
     assert _routed(output, 0)["meta"]["finished"].item() is False
 
 

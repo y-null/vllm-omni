@@ -1070,6 +1070,13 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             if not is_eos and not reached_limit:
                 codes = torch.cat([codes[-(_REPETITION_WINDOW - 1) :], sampled.reshape(1)])
                 delta = sampled.reshape(1, 1)
+                if self._k_step_frames > 0:
+                    # K-step: the multi-frame loop owns sampling, so the rows
+                    # vLLM schedules for the next step carry placeholder
+                    # continue ids. Record this frame's sample so the decode
+                    # preprocess embeds the real previous frame's codec id
+                    # (the k_last branch) instead of the placeholder.
+                    state["last_code"] = sampled_id
             else:
                 delta = empty_delta
             state["codes"] = codes
