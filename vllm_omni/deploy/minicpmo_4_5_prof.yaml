@@ -17,26 +17,15 @@ connectors:
   connector_of_shared_memory:
     name: SharedMemoryConnector
     extra:
-      connector_get_sleep_s: 0.002
       connector_get_max_wait_first_chunk: 3000
       connector_get_max_wait: 300
+      # C6 steady chunk -- the only half of C6 with a reader in this tree
+      # (minicpmo_4_5_omni.py); initial_codec_chunk_frames has no minicpmo
+      # consumer and was removed as dead config.
       codec_chunk_frames: 75
       codec_left_context_frames: 3
-      # Emit a five-frame preview first, then amortize Code2Wav's fixed
-      # per-chunk cost with large steady chunks (-9.1% RTF).
-      initial_codec_chunk_frames: 5
-      # Keep a few recent reference WAVs plus one read-only prompt-setup
-      # state so per-request setup converges to ~0 ms.
-      token2wav_runtime_prompt_cache_size: 4
-      token2wav_setup_cache_size: 1
-      # Capture only the launch-bound first/last Token2Wav chunks into
-      # NPU graphs; capture failures keep the eager path.
-      token2wav_r4p_npugraph: true
-      token2wav_r4p_max_graphs: 2
       # HiFT capture buckets are derived from codec_chunk_frames and
       # codec_left_context_frames. (#5869)
-      # A future initial_codec_chunk_frames shape will use lazy capture unless
-      # HiFTGraphWrapper.derive_capture_bucket_size explicitly includes it.
       enable_hift_graph: true
       enable_cfm_graph: true
       cfm_max_graphs: 32
@@ -172,13 +161,18 @@ platforms:
         max_num_seqs: 8
         max_num_batched_tokens: 8192
         compilation_config:
-          cudagraph_mode: PIECEWISE
+          # T1: full decode-step graph, measured -32.6% RTF vs PIECEWISE on
+          # 910B3 (entry_21, cross-card A/B). stage_config also injects this
+          # on NPU as a yaml-regression guard; keep the two in sync.
+          cudagraph_mode: FULL_DECODE_ONLY
       - stage_id: 1
         max_num_batched_tokens: 8192
         compilation_config:
-          # FULL_AND_PIECEWISE restores in-graph sampling and K-step
-          # expansion (PIECEWISE silently disables them).
-          cudagraph_mode: FULL_AND_PIECEWISE
+          # Full decode-step graph keeps in-graph sampling and K-step
+          # expansion (PIECEWISE silently disables them). Identical decode
+          # path to FULL_AND_PIECEWISE (which T1 overrode anyway); prefill
+          # runs eager either way.
+          cudagraph_mode: FULL_DECODE_ONLY
         env:
           # step-level profiling: without these the stage worker imports
           # step_prof.py with _ENABLED=false and every tic/toc is a no-op.
