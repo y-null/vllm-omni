@@ -50,7 +50,6 @@ from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTran
 from vllm_omni.distributed.omni_connectors.utils.config import stage_sends_async_output
 from vllm_omni.model_executor.duplex_sampling import DuplexSamplingRunnerMixin
 from vllm_omni.outputs import OmniModelRunnerOutput
-from vllm_omni.platforms.npu.worker import decode_prep_fast
 from vllm_omni.platforms.npu.worker import stage0_tail_draft
 from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
 from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, to_payload_element
@@ -141,8 +140,6 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             )
         self._downstream_payload_cache: dict[str, bool] = {}
         self._init_duplex_sampling_state()
-        # Perf N5/T6: steady-state decode input reuse (see decode_prep_fast).
-        self._decode_input_cache = decode_prep_fast.DecodeInputCache()
         #  -------------------------------------- Omni-new -------------------------------------------------
 
     def load_model(self, *args, **kwargs) -> None:
@@ -211,27 +208,6 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 logger.info("[minicpmo] capturing fixed-KV decode graphs at kv_capacity=%d", capacity)
                 with fixed_kv_decode.capturing_bucket(capacity):
                     super()._capture_cudagraphs(*args, **kwargs)
-
-    def _dummy_run(self, *args, **kwargs):
-        """A dummy run rewrites the shared input buffers without going through
-        ``_prepare_inputs``, so anything cached against them is stale after it."""
-        cache = getattr(self, "_decode_input_cache", None)
-        if cache is not None:
-            cache.invalidate()
-        return super()._dummy_run(*args, **kwargs)
-
-    def _prepare_inputs(self, scheduler_output, num_scheduled_tokens):
-        """Perf N5/T6: reuse the previous step's inputs when this is the same
-        decode again (the Talker spends ~118 consecutive steps per request).
-        See ``decode_prep_fast`` for the reuse rule and the gates."""
-        if not decode_prep_fast.enabled():
-            return super()._prepare_inputs(scheduler_output, num_scheduled_tokens)
-        fast = decode_prep_fast.try_fast_prepare(self, scheduler_output, num_scheduled_tokens)
-        if fast is not None:
-            return fast
-        result = super()._prepare_inputs(scheduler_output, num_scheduled_tokens)
-        decode_prep_fast.note_generic(self, scheduler_output, num_scheduled_tokens, result)
-        return result
 
     def propose_draft_token_ids(self, valid_sampled_token_ids, *args, **kwargs):
         """Carry the Talker's frame count to the scheduler, not a prediction.
