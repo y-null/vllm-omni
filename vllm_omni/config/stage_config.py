@@ -749,56 +749,6 @@ def resolve_deploy_yaml(path: str | Path) -> dict[str, Any]:
     return merged
 
 
-_MINICPMO_GRAPH_STAGES = (0, 1)
-_MINICPMO_CUDAGRAPH_ENV = "VLLM_OMNI_MINICPMO_CUDAGRAPH_MODE"
-
-
-def _apply_minicpmo_cudagraph_default(deploy: "DeployConfig") -> None:
-    """Force FULL_DECODE_ONLY for MiniCPM-o decode stages on Ascend.
-
-    The shipped minicpmo_4_5.yaml pins PIECEWISE for stages 0 and 1. Under
-    FULL_DECODE_ONLY the captured decode step stops re-issuing attention per
-    layer per step, which is where the RTF win comes from. Measured
-    output-neutral on both parts, dies/cards swapped:
-        910B3   0.3737 (FULL) vs 0.5543 (PIECEWISE)
-        910C    0.2553 / 0.2410 (FULL) vs 0.3198 / 0.3216
-    Set VLLM_OMNI_MINICPMO_CUDAGRAPH_MODE to another mode to restore config.
-    """
-    import os
-
-    mode = os.environ.get(_MINICPMO_CUDAGRAPH_ENV, "FULL_DECODE_ONLY").strip()
-    if not mode:
-        return
-    def _apply_one(cc: dict | None, label: str) -> dict:
-        current = dict(cc or {})
-        if current.get("cudagraph_mode") != mode and current.get("cudagraph_mode") is not None:
-            logger.info(
-                "[minicpmo] %s cudagraph_mode %s -> %s (measured 25-33%% RTF on Ascend; "
-                "set %s to override)",
-                label,
-                current.get("cudagraph_mode"),
-                mode,
-                _MINICPMO_CUDAGRAPH_ENV,
-            )
-        current["cudagraph_mode"] = mode
-        return current
-
-    for stage in deploy.stages:
-        if stage.stage_id in _MINICPMO_GRAPH_STAGES:
-            stage.compilation_config = _apply_one(stage.compilation_config, f"stage {stage.stage_id}")
-    # Per-platform overlays are merged after this point, so patch them too.
-    platforms = getattr(deploy, "platforms", None)
-    if isinstance(platforms, dict):
-        for pname, pcfg in platforms.items():
-            if not isinstance(pcfg, dict):
-                continue
-            for entry in pcfg.get("stages") or []:
-                if isinstance(entry, dict) and entry.get("stage_id") in _MINICPMO_GRAPH_STAGES:
-                    entry["compilation_config"] = _apply_one(
-                        entry.get("compilation_config"), f"{pname} stage {entry.get('stage_id')}"
-                    )
-
-
 _MINICPMO_TALKER_FRAMES_ENV = "VLLM_OMNI_MINICPMO_TALKER_FRAMES"
 # K = codec frames one stage-1 execute_model produces. 8 is the conservative
 # starting point on 910C/A3; K=16 measures a further -6.9% at a higher TTFP
@@ -982,7 +932,6 @@ def _apply_minicpmo_perf_defaults(deploy: "DeployConfig", config_path: object = 
         return
     if (device_name or "").lower() != "npu":
         return
-    _apply_minicpmo_cudagraph_default(deploy)
     _apply_minicpmo_talker_multiframe_default(deploy)
 
 
