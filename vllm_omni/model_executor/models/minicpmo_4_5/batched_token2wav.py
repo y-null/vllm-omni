@@ -183,17 +183,6 @@ def tensor_signature(value: torch.Tensor) -> tuple[tuple[int, ...], str, str]:
     return tuple(value.shape), str(value.dtype), value.device.type
 
 
-def _stage2_prof_enabled() -> bool:
-    """第 38 项（2026-09-20）：stage2 分段插桩开关，默认关（`OMNI_STAGE2_PROF=1` 开）。
-
-    只打日志、不改数值路径；用来把 c1 关键路径里 stage2 首块那段拆成
-    CFM（扩散）/ HiFT（声码器）两半。
-    """
-    import os as _s2_os
-
-    return _s2_os.environ.get("OMNI_STAGE2_PROF", "0") == "1"
-
-
 def state_shape_signature(state: BatchedToken2WavState) -> tuple[Any, ...]:
     flow = tuple((name, tensor_signature(state.flow_cache[name])) for name in sorted(state.flow_cache))
     hift = tuple((name, tensor_signature(state.hift_cache[name])) for name in sorted(state.hift_cache))
@@ -352,22 +341,6 @@ class BatchedToken2Wav(nn.Module):
         mel: torch.Tensor,
         source_cache: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if _stage2_prof_enabled():
-            import time as _s2_time
-
-            _s2_t0 = _s2_time.perf_counter()
-            if self.hift_graph_wrapper is None:
-                _out = self.hift.inference(mel, source_cache)
-            else:
-                _out = self.hift_graph_wrapper.replay(mel, source_cache)
-            logger.info(
-                "[S2PROF] hift=%.1fms mel_frames=%d batch=%d graph=%s",
-                (_s2_time.perf_counter() - _s2_t0) * 1e3,
-                int(mel.shape[-1]),
-                int(mel.shape[0]),
-                self.hift_graph_wrapper is not None,
-            )
-            return _out
         if self.hift_graph_wrapper is None:
             return self.hift.inference(mel, source_cache)
         return self.hift_graph_wrapper.replay(mel, source_cache)
@@ -1207,11 +1180,6 @@ class BatchedToken2Wav(nn.Module):
         with self._autocast(padded_hidden.device):
             projected_speakers = self.flow.spk_embed_affine_layer(F.normalize(speakers, dim=1))
             cond = torch.zeros_like(padded_hidden).transpose(1, 2).contiguous()
-            _s2_t0 = 0.0
-            if _stage2_prof_enabled():
-                import time as _s2_time
-
-                _s2_t0 = _s2_time.perf_counter()
             chunk_mel, estimator_cnn, estimator_att = self._decode_cfm(
                 padded_hidden.transpose(1, 2).contiguous(),
                 projected_speakers,
@@ -1220,13 +1188,6 @@ class BatchedToken2Wav(nn.Module):
                 att_cache=flow_cache["estimator_att_cache"],
                 valid_lengths=hidden_lengths,
             )
-            if _stage2_prof_enabled():
-                logger.info(
-                    "[S2PROF] cfm=%.1fms batch=%d n_timesteps=%d",
-                    (_s2_time.perf_counter() - _s2_t0) * 1e3,
-                    batch_size,
-                    self.n_timesteps,
-                )
 
         prompt_len = int(features.mels.shape[1])
         assert isinstance(estimator_att, list)
