@@ -137,11 +137,11 @@ stages:
     max_num_batched_tokens: 65536
     max_model_len: 65536
     devices: "0"
-    # 第 46 项：stage2 双副本已采纳（r44：c4 −29.8% / c8 −41.7%）。
-    # devices 只有一个 id 时走"模板模式"（engine/stage_init_utils.py:829-850）：
-    # 副本 r 落到卡 r*1+0。
-    # 第 47 项（正在验证）：2 -> 3，看吞吐能否继续抬升；无收益即回到 2。
-    num_replicas: 3
+    # 第 46 项（stage2 多副本）已回退：它实战有效（r44 双副本 c4 −29.8% / c8 −41.7%；
+    # r45 三副本 c4 再 −22.8% / c8 再 −11.4%），但**需要多张卡**，多数部署形态是单卡，
+    # 强开会导致那些场景起不来。现按"待讨论"处理，配置与数字见
+    # perf_opt/optimization_items_checklist.md 的"待讨论"章节；恢复方法就是在这里加回
+    # `num_replicas: 2`（模板模式下副本 r 落到卡 r）。
     input_connectors:
       from_stage_1: connector_of_shared_memory
     default_sampling_params:
