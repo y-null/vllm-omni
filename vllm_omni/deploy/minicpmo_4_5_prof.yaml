@@ -20,9 +20,10 @@ connectors:
       connector_get_max_wait_first_chunk: 3000
       connector_get_max_wait: 300
       # C6 steady chunk -- the only half of C6 with a reader in this tree
-      # (minicpmo_4_5_omni.py); initial_codec_chunk_frames has no minicpmo
-      # consumer and was removed as dead config.
+      # (minicpmo_4_5_omni.py). 第 13 项（2026-09-20）：initial_codec_chunk_frames
+      # 已在该处理器里实现（首个 payload 用 25 帧、稳态仍 75 帧）。
       codec_chunk_frames: 75
+      initial_codec_chunk_frames: 25
       codec_left_context_frames: 3
       # HiFT capture buckets are derived from codec_chunk_frames and
       # codec_left_context_frames. (#5869)
