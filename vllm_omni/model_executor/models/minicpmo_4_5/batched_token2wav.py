@@ -9,8 +9,6 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, cast
 
-import os
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -19,85 +17,6 @@ from vllm.logger import init_logger
 from .cuda_graph_wrapper import CFMGraphWrapper, HiFTGraphWrapper
 
 logger = init_logger(__name__)
-
-# ---------------------------------------------------------------------------
-# 第 28 项（只读诊断）：rows / pass 分布直方图
-#
-# Why: `rows=2/call` is an *average*. Whether the remaining c8 headroom is in
-# "aggregate more rows per call" or in "bucket the rows inside a call" depends
-# entirely on the distribution, and we have never measured it. These counters
-# change no behaviour: they are gated by VLLM_OMNI_MINICPMO_ROWS_HIST (default
-# off) and only accumulate ints in the worker process.
-# ---------------------------------------------------------------------------
-_ROWS_HIST: list[tuple[int, ...]] = []
-_ROWS_PASS: dict[str, list[int]] = {"encode": [], "vocoder": []}
-_ROWS_CALLS: dict[str, int] = {"batch": 0, "ragged": 0}
-_ROWS_HIST_EVERY = 10
-
-
-def _rows_hist_call(name: str) -> None:
-    """Count how often each decode entry point is used.
-
-    The ragged entry point is the one every "ragged" optimisation (item 15)
-    targets; if the counters show it is rarely taken, that alone explains why
-    those changes measured neutral, and it moves the search to the other path.
-    """
-    if not _rows_hist_enabled():
-        return
-    try:
-        _ROWS_CALLS[name] = _ROWS_CALLS.get(name, 0) + 1
-    except Exception:
-        pass
-
-
-def _rows_hist_enabled() -> bool:
-    return os.environ.get("VLLM_OMNI_MINICPMO_ROWS_HIST", "").strip().lower() in ("1", "true", "on")
-
-
-def _rows_hist_note(batch_size: int, tokens: object) -> None:
-    """Record one decode call: how many rows, and which frame counts they carry."""
-    if not _rows_hist_enabled():
-        return
-    try:
-        frames = tuple(sorted(int(t.numel()) for t in tokens))  # type: ignore[attr-defined]
-        _ROWS_HIST.append((int(batch_size),) + frames)
-    except Exception:
-        pass
-
-
-def _rows_hist_pass(name: str, count: int) -> None:
-    """Record how many serial passes one phase needed for this call."""
-    if not _rows_hist_enabled():
-        return
-    try:
-        _ROWS_PASS.setdefault(name, []).append(int(count))
-    except Exception:
-        pass
-
-
-def _rows_hist_flush() -> None:
-    """Log the distributions every _ROWS_HIST_EVERY calls (first call included)."""
-    if not _rows_hist_enabled():
-        return
-    try:
-        n = len(_ROWS_HIST)
-        if not n or n % _ROWS_HIST_EVERY != 1:
-            return
-        from collections import Counter
-
-        rows_dist = dict(sorted(Counter(r[0] for r in _ROWS_HIST).items()))
-        mixed = 100.0 * sum(1 for r in _ROWS_HIST if len(set(r[1:])) > 1) / n
-        passes = {k: dict(sorted(Counter(v).items())) for k, v in _ROWS_PASS.items() if v}
-        logger.info(
-            "[rows-hist] n=%d rows=%s mixed_frames=%.0f%% passes=%s calls=%s",
-            n,
-            rows_dist,
-            mixed,
-            passes,
-            dict(_ROWS_CALLS),
-        )
-    except Exception:
-        pass
 
 _SILENCE_TOKEN = 4218
 # CosyVoice2 RelPos PE is built for max_len=5000 and `forward_chunk` never
@@ -1217,8 +1136,6 @@ class BatchedToken2Wav(nn.Module):
         if batch_size == 0:
             return [], []
 
-        _rows_hist_note(batch_size, tokens)
-        _rows_hist_call("ragged")
         lookahead = self._pre_lookahead_len()
         for row, (row_tokens, last_chunk) in enumerate(zip(tokens, last_chunks, strict=True)):
             num_frames = int(row_tokens.numel())
@@ -1249,14 +1166,10 @@ class BatchedToken2Wav(nn.Module):
                 for group_row, row in enumerate(rows):
                     audios[row] = group_audio[group_row]
                     next_states[row] = group_states[group_row]
-            _rows_hist_pass("encode", len(exact_groups))
-            _rows_hist_pass("vocoder", len(exact_groups))
-            _rows_hist_flush()
             return self._require_complete_ragged_outputs(audios, next_states)
         encoder_groups: dict[tuple[int, bool], list[int]] = {}
         for row, (row_tokens, last_chunk) in enumerate(zip(tokens, last_chunks, strict=True)):
             encoder_groups.setdefault((int(row_tokens.numel()), last_chunk), []).append(row)
-        _rows_hist_pass("encode", len(encoder_groups))
 
         hidden_rows: list[torch.Tensor | None] = [None] * batch_size
         conformer_cnn_rows: list[torch.Tensor | None] = [None] * batch_size
@@ -1358,7 +1271,6 @@ class BatchedToken2Wav(nn.Module):
         vocoder_groups: dict[tuple[int, bool], list[int]] = {}
         for row, last_chunk in enumerate(last_chunks):
             vocoder_groups.setdefault((hidden_lengths[row], last_chunk), []).append(row)
-        _rows_hist_pass("vocoder", len(vocoder_groups))
         for (hidden_length, last_chunk), rows in vocoder_groups.items():
             old_mel = torch.cat([states[row].hift_cache["mel"] for row in rows], dim=0)
             old_source = torch.cat([states[row].hift_cache["source"] for row in rows], dim=0)
@@ -1387,5 +1299,4 @@ class BatchedToken2Wav(nn.Module):
                     },
                 )
 
-        _rows_hist_flush()
         return self._require_complete_ragged_outputs(audios, next_states)
