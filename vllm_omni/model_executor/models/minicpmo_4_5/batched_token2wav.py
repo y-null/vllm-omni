@@ -1133,6 +1133,11 @@ class BatchedToken2Wav(nn.Module):
             )
             projected_speakers = self.flow.spk_embed_affine_layer(F.normalize(speakers, dim=1))
             cond = torch.zeros_like(hidden).transpose(1, 2).contiguous()
+            _s2_t0 = 0.0
+            if _stage2_prof_enabled():
+                import time as _s2_time
+
+                _s2_t0 = _s2_time.perf_counter()
             chunk_mel, estimator_cnn, estimator_att = self._decode_cfm(
                 hidden.transpose(1, 2).contiguous(),
                 projected_speakers,
@@ -1140,6 +1145,17 @@ class BatchedToken2Wav(nn.Module):
                 cnn_cache=flow_cache["estimator_cnn_cache"],
                 att_cache=flow_cache["estimator_att_cache"],
             )
+            if _stage2_prof_enabled():
+                import time as _s2_time
+
+                # "even" = 同构批（等长、无 attn_mask，走图）；ragged 分支打印的是
+                # "cfm="（带 mask）。两个数字放在一起就能回答"mask 路径到底慢多少"。
+                logger.info(
+                    "[S2PROF] cfm(even)=%.1fms batch=%d n_timesteps=%d",
+                    (_s2_time.perf_counter() - _s2_t0) * 1e3,
+                    batch_size,
+                    self.n_timesteps,
+                )
 
         prompt_len = int(features.mels.shape[1])
         if estimator_att.shape[4] > prompt_len + 100:
