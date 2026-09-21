@@ -188,4 +188,4 @@ platforms:
         # estimator kernels through the NPU platform patch.
         additional_config:
           code2wav_enable_npu_graph: true
-          code2wav_max_npu_graphs: 32
+          code2wav_max_npu_graphs: 64
