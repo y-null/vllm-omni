@@ -137,6 +137,10 @@ stages:
     max_num_batched_tokens: 65536
     max_model_len: 65536
     devices: "0"
+    # 第 46 项：stage2 双副本。devices 只有一个 id 时走"模板模式"
+    # （engine/stage_init_utils.py:829-850）：副本 r 落到卡 r*1+0，即卡 0 与卡 1。
+    # 依据：CFM 是 stage2 的串行上限（2 行 / 920ms，且与并发档无关），加副本可翻倍吞吐。
+    num_replicas: 2
     input_connectors:
       from_stage_1: connector_of_shared_memory
     default_sampling_params:
