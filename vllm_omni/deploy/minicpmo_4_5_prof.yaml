@@ -1,4 +1,20 @@
 # MiniCPM-o 4.5 three-stage deploy on one large-memory GPU.
+#
+# ==================== 优化项配置的唯一载体（2026-09-21 归并）====================
+# 所有「已实测优化项」的开关与数值都写在本文件里，不再散落成 perf_opt/ 下的临时副本。
+#
+# 本配置 = **单卡双副本形态**（第 54 项，状态：待讨论（已实测））
+#   实测（对照同卡单副本 0.4941 / 1.1357 / 2.1229）：
+#     c1 0.4834（−2%）/ c4 0.8321（−26.7%）/ c8 1.3840（−34.8%，复跑 1.4503）
+#   2026-09-21 复测最佳一轮：c1 0.4689 / c4 0.8619 / c8 1.4071 / WER 1.2179%（= 基线，零精度代价）
+#   0 次 OOM；图池捕获 31/32（未触顶）
+# 前提与代价：① stage0/1 的 KV 被显式压到 6 GiB / 2.5 GiB —— 长上下文场景需重估；
+#             ② CFM mel 分桶必须在 NPU 上生效（运行时 env VLLM_OMNI_C2W_NPU_BUCKET=1，
+#                第 11/58 项）；它是形状收敛、图池不触顶的前置条件；
+#             ③ 图池按双副本形态取 32/副本（单副本形态取 64，第 10 项）。
+# 回到保守形态：删掉 stage2 的 num_replicas / devices 第二张卡位、删掉 npu 块里的两个
+# kv_cache_memory_bytes、gpu_memory_utilization 恢复 0.55 / 0.15、图池改回 64。
+# =============================================================================
 pipeline: minicpmo_4_5
 async_chunk: true
 # Native full-duplex shares this profile with /v1/chat/completions. Every other
@@ -30,6 +46,9 @@ connectors:
       enable_hift_graph: true
       enable_cfm_graph: true
       cfm_max_graphs: 32
+      # 桶宽 16（第 11 项）：把 CFM 捕获形状 64 -> 19。⚠ NPU 上生效需要运行时 env
+      # VLLM_OMNI_C2W_NPU_BUCKET=1（第 58 项的最小形式修复）；否则桶宽恒为 0、形状不收敛、
+      # 图池被打满并永久退 eager —— 这是第 54 项双副本形态能装下的前提之一。
       cfm_graph_bucket_frames: 16
 
 stages:
@@ -42,7 +61,9 @@ stages:
       torch_profiler_with_memory: false
     max_num_seqs: 4
     # Leave headroom on the shared GPU for Talker KV + concurrent Code2Wav.
-    gpu_memory_utilization: 0.55
+    # 第 54 项（单卡双副本形态）：0.55 -> 0.40，把省下的显存让给 stage2 的两张副本
+    # （对应 npu 块的 kv_cache_memory_bytes: 6 GiB）。
+    gpu_memory_utilization: 0.40
     enforce_eager: false
     # Stage-level prefix caching override (the top level stays false for
     # duplex safety; stage0 requests reuse their own prefixes).
@@ -50,6 +71,10 @@ stages:
     # N-gram speculative decoding on stage0. async_scheduling must stay false
     # next to it: vLLM's VllmConfig validation rejects the combination.
     async_scheduling: false
+    # 第 3 项（已采纳）：stage0 ngram 投机 k=14，实测 RTF −11.8% / −3.7% / −5.9%、TTFT −69%。
+    # ⚠ 注意：2026-09-21 单卡双副本那几轮用的临时副本（perf_opt/mig_*.yaml）里**没有这一段**
+    #   （已逐份核对），因此 c8 1.4071 那组数字不含第 3 项的贡献；带回来需重测确认。
+    #   本文件保持它在位 —— 以本文件为准的读者拿到的才是完整优化集。
     speculative_config:
       method: ngram
       num_speculative_tokens: 14
@@ -91,7 +116,8 @@ stages:
     # Preserve the checkpoint's full-attention Talker prompt while it fits;
     # native duplex rolls over to a one-chunk window at context capacity.
     # Leave device-level headroom for the colocated HiFi-GAN cuDNN workspace.
-    gpu_memory_utilization: 0.15
+    # 第 54 项（单卡双副本形态）：0.15 -> 0.08（对应 npu 块的 2.5 GiB）。
+    gpu_memory_utilization: 0.08
     enforce_eager: false
     max_num_batched_tokens: 8192
     # Talker context is 4096 (tts_config.max_position_embeddings).
@@ -136,12 +162,12 @@ stages:
     enable_chunked_prefill: false
     max_num_batched_tokens: 65536
     max_model_len: 65536
-    devices: "0"
-    # 第 46 项（stage2 多副本）已回退：它实战有效（r44 双副本 c4 −29.8% / c8 −41.7%；
-    # r45 三副本 c4 再 −22.8% / c8 再 −11.4%），但**需要多张卡**，多数部署形态是单卡，
-    # 强开会导致那些场景起不来。现按"待讨论"处理，配置与数字见
-    # perf_opt/optimization_items_checklist.md 的"待讨论"章节；恢复方法就是在这里加回
-    # `num_replicas: 2`（模板模式下副本 r 落到卡 r）。
+    # 第 54 项（单卡双副本，2026-09-21 实测）：两张副本压在**同一张卡**上，不需要额外的卡。
+    # devices 把同一张卡写两次（模板模式下副本 r 落到卡 r），所以第 46/47 项"需要多卡"的
+    # 限制在这里不成立。第 46/47 项（跨卡双副本/三副本）仍为待讨论：r44 双副本 c4 −29.8% /
+    # c8 −41.7%；r45 三副本 c4 再 −22.8% / c8 再 −11.4%（配置与数字见项目任务书）。
+    num_replicas: 2
+    devices: "0,0"
     input_connectors:
       from_stage_1: connector_of_shared_memory
     default_sampling_params:
@@ -166,6 +192,9 @@ platforms:
       - stage_id: 0
         max_num_seqs: 8
         max_num_batched_tokens: 8192
+        # 第 54 项（单卡双副本形态）：显式 KV 6 GiB（原 0.55 自动算出 7.83 GiB / 56,960 tokens；
+        # 改后 ≈43.6k tokens，相对请求量 1.07x@40,960 —— 长上下文场景需重估）。
+        kv_cache_memory_bytes: 6442450944
         compilation_config:
           # T1: full decode-step graph, measured -32.6% RTF vs PIECEWISE on
           # 910B3 (entry_21, cross-card A/B). stage_config also injects this
@@ -176,6 +205,8 @@ platforms:
         # stage0 和 stage2，stage1 沿用基座的 4，这一格是漏配。
         max_num_seqs: 8
         max_num_batched_tokens: 8192
+        # 第 54 项（单卡双副本形态）：显式 KV 2.5 GiB（原 0.15 自动算出 8.27 GiB / 144,384）。
+        kv_cache_memory_bytes: 2684354560
         compilation_config:
           # Full decode-step graph keeps in-graph sampling and K-step
           # expansion (PIECEWISE silently disables them). Identical decode
@@ -193,4 +224,7 @@ platforms:
         # estimator kernels through the NPU platform patch.
         additional_config:
           code2wav_enable_npu_graph: true
-          code2wav_max_npu_graphs: 64
+          # 第 10 项（单副本形态取 64：c4 −17.0% / c8 −23.5%，r34 对照 r22）＋
+          # 第 54 项（单卡双副本：每副本 32 —— 分桶后形状约 31，两副本图内存约 10 GiB 装得下；
+          # 取 64 会让两份副本的图内存叠加而越界）。
+          code2wav_max_npu_graphs: 32
