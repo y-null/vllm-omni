@@ -281,10 +281,10 @@ class MiniCPMO45Code2Wav(nn.Module):
             raise ValueError("MiniCPM-o Code2Wav code2wav_initial_batch_size must be >= 0")
         if self._initial_batch_size and self._initial_batch_size < self._min_batch_size:
             raise ValueError("MiniCPM-o Code2Wav code2wav_initial_batch_size must be 0 or >= code2wav_min_batch_size")
-        # Item 49 (env-gated, default off): force one row per stage-2 decode
-        # batch so CFM deterministically takes the even path (graph replay)
-        # instead of the eager ragged path on mixed-length batches.
-        self._single_row_batch = os.environ.get("VLLM_OMNI_C2W_SINGLE_ROW", "") == "1"
+        # Off by default: force one row per stage-2 decode batch so CFM
+        # deterministically takes the even path (graph replay) instead of the
+        # eager ragged path on mixed-length batches.
+        self._single_row_batch = bool(extra.get("code2wav_single_row_batch", False))
         self._default_prompt_id = str(extra.get("prompt_cache_id", "HT_ref_audio"))
         self._prompt_wav_override = extra.get("prompt_wav")
         self._default_prompt_normalized: tuple[str, str] | None = None
@@ -1018,13 +1018,13 @@ class MiniCPMO45Code2Wav(nn.Module):
             torch.set_default_dtype(previous_dtype)
 
         trt_stepper = None
-        use_trt = bool(extra.get("token2wav_trt", False)) or os.environ.get("MINICPMO_TOKEN2WAV_TRT", "") == "1"
+        use_trt = bool(extra.get("token2wav_trt", False))
         # TensorRT is CUDA-only; other platforms ignore the toggle.
         if use_trt and current_omni_platform.is_cuda():
             from vllm_omni.model_executor.models.step_audio2.step_audio2_dit_trt import build_dit_trt_stepper
 
             dtype_name = str(
-                extra.get("token2wav_trt_dtype", os.environ.get("MINICPMO_TOKEN2WAV_TRT_DTYPE", "fp16"))
+                extra.get("token2wav_trt_dtype", "fp16")
             ).lower()
             trt_dtype = torch.float32 if dtype_name in ("fp32", "float32") else torch.float16
             max_batch = int(extra.get("token2wav_trt_max_batch", 16))
