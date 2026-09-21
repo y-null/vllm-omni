@@ -281,6 +281,10 @@ class MiniCPMO45Code2Wav(nn.Module):
             raise ValueError("MiniCPM-o Code2Wav code2wav_initial_batch_size must be >= 0")
         if self._initial_batch_size and self._initial_batch_size < self._min_batch_size:
             raise ValueError("MiniCPM-o Code2Wav code2wav_initial_batch_size must be 0 or >= code2wav_min_batch_size")
+        # Item 49 (env-gated, default off): force one row per stage-2 decode
+        # batch so CFM deterministically takes the even path (graph replay)
+        # instead of the eager ragged path on mixed-length batches.
+        self._single_row_batch = os.environ.get("VLLM_OMNI_C2W_SINGLE_ROW", "") == "1"
         self._default_prompt_id = str(extra.get("prompt_cache_id", "HT_ref_audio"))
         self._prompt_wav_override = extra.get("prompt_wav")
         self._default_prompt_normalized: tuple[str, str] | None = None
@@ -666,6 +670,13 @@ class MiniCPMO45Code2Wav(nn.Module):
         buckets: Iterable[list[_WorkItem]],
     ) -> Iterable[list[_WorkItem]]:
         for bucket in buckets:
+            if self._single_row_batch:
+                # Item 49: one row per batch keeps every CFM call on the even
+                # path (uniform length -> graph replay). Deliberately bypasses
+                # the wave split and the min-batch guard below.
+                for item in bucket:
+                    yield [item]
+                continue
             if not self._initial_batch_size:
                 yield bucket
                 continue
