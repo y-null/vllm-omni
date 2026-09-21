@@ -20,15 +20,20 @@ connectors:
       connector_get_max_wait_first_chunk: 3000
       connector_get_max_wait: 300
       # C6 steady chunk -- the only half of C6 with a reader in this tree
-      # (minicpmo_4_5_omni.py); initial_codec_chunk_frames has no minicpmo
-      # consumer and was removed as dead config.
+      # (minicpmo_4_5_omni.py). The first payload takes the smaller window so
+      # stage 2 starts earlier; both are codec frame counts.
       codec_chunk_frames: 75
+      initial_codec_chunk_frames: 25
       codec_left_context_frames: 3
       # HiFT capture buckets are derived from codec_chunk_frames and
       # codec_left_context_frames. (#5869)
       enable_hift_graph: true
       enable_cfm_graph: true
       cfm_max_graphs: 32
+      # Pad CFM decode chunks up to a multiple of 16 mel frames. Padding makes
+      # the capture key space collapse (64 -> 19 shapes), which keeps the graph
+      # pool reusable; it needs CFM graph capture enabled above, and applies on
+      # CUDA and NPU alike.
       cfm_graph_bucket_frames: 16
 
 stages:
@@ -142,6 +147,8 @@ platforms:
           # on NPU as a yaml-regression guard; keep the two in sync.
           cudagraph_mode: FULL_DECODE_ONLY
       - stage_id: 1
+        # Without this, stage 1 keeps the base stage's 4 while stage 0 runs 8.
+        max_num_seqs: 8
         max_num_batched_tokens: 8192
         compilation_config:
           # Full decode-step graph keeps in-graph sampling and K-step
