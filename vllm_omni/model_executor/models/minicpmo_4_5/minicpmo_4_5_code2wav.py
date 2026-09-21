@@ -1018,13 +1018,13 @@ class MiniCPMO45Code2Wav(nn.Module):
             torch.set_default_dtype(previous_dtype)
 
         trt_stepper = None
-        use_trt = bool(extra.get("token2wav_trt", False))
+        use_trt = bool(extra.get("token2wav_trt", False)) or os.environ.get("MINICPMO_TOKEN2WAV_TRT", "") == "1"
         # TensorRT is CUDA-only; other platforms ignore the toggle.
         if use_trt and current_omni_platform.is_cuda():
             from vllm_omni.model_executor.models.step_audio2.step_audio2_dit_trt import build_dit_trt_stepper
 
             dtype_name = str(
-                extra.get("token2wav_trt_dtype", "fp16")
+                extra.get("token2wav_trt_dtype", os.environ.get("MINICPMO_TOKEN2WAV_TRT_DTYPE", "fp16"))
             ).lower()
             trt_dtype = torch.float32 if dtype_name in ("fp32", "float32") else torch.float16
             max_batch = int(extra.get("token2wav_trt_max_batch", 16))
