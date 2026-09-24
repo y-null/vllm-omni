@@ -7,6 +7,14 @@ becomes its own CUDA-graph capture shape (428 captures / 13 flushes in the
 #6628 regression). ``_cfm_pad_frames`` aligns the frame axis onto a grid so
 steady-state calls share one capture shape; ``_decode_cfm`` trims the output
 back. These tests pin the decision math on CPU, no CUDA required.
+
+The last three tests pin the cache-width side of the capture-shape explosion:
+``_decode_batch_once`` trims each request's attention cache to its own
+``prompt_len + 100``, so concurrent requests with distinct reference prompts
+own distinct steady-state shapes. ``_cache_align_width`` is the planned
+grid-alignment of that trim target (not wired yet): pad the cache once at
+setup time to the aligned width, mask the pad columns, and every request
+lands on one of a few (chunk bucket, cache bucket) capture shapes.
 """
 
 from types import SimpleNamespace
@@ -15,6 +23,7 @@ import pytest
 import torch
 
 from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
+    _cache_align_width,
     _cfm_pad_frames,
     _zero_padded_cnn_cache,
     _zero_padded_frames,
@@ -227,3 +236,90 @@ def test_zero_padded_cnn_cache_uniform_blocks_use_one_write():
     assert cache._version - version == 1
     assert torch.equal(cache[..., :3], torch.ones(16, 2, 3, 3))
     assert torch.count_nonzero(cache[..., 3:]) == 0
+
+
+# --- Cache-width side of the capture-shape explosion -----------------------
+
+
+def _cache_align_width_disabled(width: int) -> int:
+    return width
+
+
+def _capture_shapes_for_requests(
+    prompt_lengths: tuple[int, ...],
+    n_chunks: int,
+    cache_align,
+) -> set[tuple[int, int]]:
+    """Simulate the (chunk_width, cache_width) NPUGraph capture shapes.
+
+    Mirrors the ``_decode_batch_once`` recurrence: the cache grows by the
+    padded chunk width and trims to ``prompt_len + 100``. With a grid
+    ``cache_align`` the trim target is aligned and the cache is padded once
+    at setup time (no growth path), so each request lands directly on its
+    (chunk bucket, cache bucket) shape.
+    """
+    shapes: set[tuple[int, int]] = set()
+    for prompt_len in prompt_lengths:
+        if cache_align is _cache_align_width_disabled:
+            cap = prompt_len + 100
+            width = prompt_len
+            for index in range(n_chunks):
+                mel = 7 if index == 0 else 50
+                pad = _cfm_pad_frames(
+                    mel_frames=mel,
+                    offset=width,
+                    noise_capacity=30000,
+                    bucket_frames=16,
+                    disabled=False,
+                )
+                shapes.add((mel + pad, width))
+                width = min(width + mel + pad, cap)
+        else:
+            cap = cache_align(prompt_len + 100)
+            for chunk_width in (16, 64):  # first chunk (7+9), steady (50+14)
+                shapes.add((chunk_width, cap))
+    return shapes
+
+
+def test_current_trim_yields_32_capture_shapes_across_8_requests():
+    """Pin the c8 NPUGraph-limit mechanism seen in the i70 serve log.
+
+    Eight requests with distinct reference prompt lengths each produce four
+    shapes (first chunk + two growth steps + steady state): 8 x 4 = 32, i.e.
+    exactly the default max_graphs limit. This is the mechanism behind the
+    "reached the 32-entry NPUGraph limit" warning at c8, after which every
+    new shape degrades to eager execution.
+    """
+    prompts = (200, 240, 280, 320, 360, 400, 440, 480)
+    shapes = _capture_shapes_for_requests(prompts, n_chunks=30, cache_align=_cache_align_width_disabled)
+    assert len(shapes) == 32
+    # No cross-request sharing: every request settles on its own steady shape.
+    for prompt_len in prompts:
+        assert (64, prompt_len + 100) in shapes
+
+
+def test_cache_align_width_basics():
+    assert _cache_align_width(300, 256) == 512
+    assert _cache_align_width(512, 256) == 512
+    assert _cache_align_width(513, 256) == 768
+    assert _cache_align_width(300, 0) == 300
+    assert _cache_align_width(300, 1) == 300
+    assert _cache_align_width(0, 256) == 0
+    assert _cache_align_width(-5, 256) == -5
+
+
+def test_cache_bucketing_collapses_8_requests_onto_few_shapes():
+    """The cache-bucket design: one shape per (chunk bucket, cache bucket).
+
+    Setup pads the cache once to the aligned trim target, so the growth path
+    disappears; requests with nearby prompt lengths share a cache bucket.
+    """
+    prompts = (200, 240, 280, 320, 360, 400, 440, 480)
+    shapes = _capture_shapes_for_requests(
+        prompts,
+        n_chunks=30,
+        cache_align=lambda width: _cache_align_width(width, 256),
+    )
+    # 2 cache buckets (512, 768) x 2 chunk buckets (16, 64).
+    assert len(shapes) == 4, sorted(shapes)
+    assert len(shapes) < 32

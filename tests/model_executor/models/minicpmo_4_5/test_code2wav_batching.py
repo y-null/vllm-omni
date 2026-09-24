@@ -223,7 +223,7 @@ def test_setup_cache_keys_batch_size_and_evicts_least_recent_entry():
     adapter.setup_batch(prompt, 1)
 
     assert token2wav.flow.encoder.calls == [1, 2, 1]
-    assert list(adapter._setup_cache) == [(prompt.cache_key, 1, 0)]
+    assert list(adapter._setup_cache) == [(prompt.cache_key, 1, 0, 0)]
 
 
 def test_evict_prompt_clears_features_and_setup_state():
@@ -1631,8 +1631,8 @@ def test_setup_cache_misses_when_cfm_graph_padding_is_disabled(monkeypatch, disa
     assert unpadded[0] is not padded[0]
     assert reused[0] is unpadded[0]
     assert adapter.flow.encoder.calls == [1, 1]
-    assert padded_keys == [(prompt.cache_key, 1, 16)]
-    assert list(adapter._setup_cache) == [(prompt.cache_key, 1, 0)]
+    assert padded_keys == [(prompt.cache_key, 1, 16, 0)]
+    assert list(adapter._setup_cache) == [(prompt.cache_key, 1, 0, 0)]
 
 
 def test_padded_chunk_keeps_the_cross_chunk_caches_on_the_valid_boundary():

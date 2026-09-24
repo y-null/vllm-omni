@@ -432,3 +432,66 @@ def test_code2wav_pad_mask_replays_as_a_graph_input(monkeypatch):
     assert calls[0][2] == (False, True)
     assert any(item is mask for item in calls[0][1])
     assert seen[0] is mask
+
+
+def test_captured_graph_replay_writes_sink_outputs_in_place():
+    static_input = torch.zeros(1)
+    static_output = torch.zeros(1)
+
+    class _Graph:
+        def replay(self):
+            static_output.copy_(static_input * 2)
+
+    graph = CapturedDeviceGraph(
+        graph=_Graph(),
+        static_inputs=(static_input,),
+        static_outputs=(static_output,),
+    )
+
+    # Sink slot: output is copied straight into the caller buffer (no clone).
+    sink = torch.empty(1)
+    returned = graph.replay((torch.tensor([3.0]),), output_into=(sink,))[0]
+    torch.testing.assert_close(sink, torch.tensor([6.0]))
+    assert returned is sink
+
+    # None slot keeps the legacy clone semantics.
+    plain = graph.replay((torch.tensor([5.0]),), output_into=(None,))[0]
+    torch.testing.assert_close(plain, torch.tensor([10.0]))
+    assert plain.data_ptr() != static_output.data_ptr()
+
+
+def test_runner_replay_forwards_output_into_to_graph(monkeypatch):
+    from vllm_omni.platforms.npu.graph_tools import _tensor_signature
+
+    runner = NPUExactGraphRunner()
+    # Bypass the npu-device gate; the replay path under test is device-agnostic.
+    monkeypatch.setattr(NPUExactGraphRunner, "_eligible", lambda self, inputs: True)
+    replayed = []
+
+    class _Graph:
+        def replay(self, inputs, output_into=None):
+            replayed.append((inputs, output_into))
+            if output_into is None:
+                return tuple(value.clone() for value in self.static_outputs)
+            return tuple(
+                value if destination is None else destination.copy_(value)
+                for destination, value in zip(output_into, self.static_outputs, strict=True)
+            )
+
+    static_input = torch.zeros(1)
+    static_output = torch.zeros(1)
+    graph = _Graph()
+    graph.static_inputs = (static_input,)
+    graph.static_outputs = (static_output,)
+    key = ("op", (), (_tensor_signature(torch.tensor([2.0])),))
+    runner._graphs[key] = graph
+
+    sink = torch.empty(1)
+    result = runner.run("op", (torch.tensor([2.0]),), (), lambda *a: (torch.zeros(1),), output_into=(sink,))
+    assert replayed[0][1] == (sink,)
+    torch.testing.assert_close(sink, torch.tensor([0.0]))
+    assert result == (sink,)
+
+    plain = runner.run("op", (torch.tensor([4.0]),), (), lambda *a: (torch.zeros(1),))
+    assert replayed[1][1] is None
+    assert plain[0].data_ptr() != static_output.data_ptr()

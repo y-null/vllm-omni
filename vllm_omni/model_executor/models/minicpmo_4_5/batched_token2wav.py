@@ -83,6 +83,79 @@ def _cfm_pad_frames(
     return pad
 
 
+def _cache_align_width(width: int, bucket: int) -> int:
+    """Align the steady-state cache width up onto the capture-shape grid.
+
+    ``_decode_batch_once`` trims the attention cache to ``prompt_len + 100``,
+    so every request settles on its own cache width -- one NPUGraph capture
+    per distinct reference prompt length. Aligning the trim target up to
+    ``bucket`` collapses requests with nearby prompt lengths onto the same
+    capture shape. Returns the width unchanged when bucketing is off.
+    """
+    if bucket <= 1 or width <= 0:
+        return width
+    return ((width + bucket - 1) // bucket) * bucket
+
+
+def _estimator_att_pad_columns(prev_valid: torch.Tensor, offset: int) -> torch.Tensor | None:
+    """Cache-pad key mask columns, or None when every cache frame is valid.
+
+    ``prev_valid`` holds the number of valid cache frames per request row;
+    cache frames beyond that are bucket padding and must be excluded from
+    softmax (a zero-valued key still takes probability mass out of the
+    denominator). Returns a ``(rows, offset)`` bool tensor, True = valid.
+    """
+    if prev_valid is None or int(prev_valid.numel()) == 0:
+        return None
+    if bool((prev_valid >= offset).all()):
+        return None
+    positions = torch.arange(offset, device=prev_valid.device)
+    return positions.unsqueeze(0) < prev_valid.unsqueeze(1)
+
+
+def _align_estimator_cache(
+    estimator_att: torch.Tensor,
+    prompt_len: int,
+    cache_width: int,
+    valid_frames: int,
+    cache_offset: int,
+) -> tuple[torch.Tensor, int]:
+    """Trim/pad one estimator attention cache onto the aligned capture grid.
+
+    ``estimator_att`` is the decoder output: the incoming cache (physically
+    ``cache_offset`` wide, of which only the first ``valid_frames`` are valid,
+    the rest being bucket padding) followed by the newly appended frames.
+    The pad columns are dropped first; the result keeps ``[0:prompt_len]``
+    plus the tail ``cache_width - prompt_len`` valid frames -- the legacy
+    ``prompt+100`` window semantics, widened to the aligned grid -- and is
+    padded back to ``cache_width`` so the NPUGraph capture shape stays
+    constant. Returns the cache and its new valid frame count.
+    """
+    keep = cache_width - prompt_len
+    # The cache is a 6-D tensor (depth, batch, cfg, heads, kv, att_width);
+    # the kv axis is dim 4 and every slice below must target it.
+    if valid_frames < cache_offset:
+        estimator_att = torch.cat(
+            (
+                estimator_att[..., :valid_frames, :],
+                estimator_att[..., cache_offset:, :],
+            ),
+            dim=4,
+        )
+    total_valid = int(estimator_att.shape[4])
+    if total_valid > prompt_len + keep:
+        estimator_att = torch.cat(
+            (estimator_att[..., :prompt_len, :], estimator_att[..., -keep:, :]),
+            dim=4,
+        )
+        return estimator_att, cache_width
+    # F.pad's tuple starts at the last axis: pad dim4 (kv) right by n.
+    estimator_att = torch.nn.functional.pad(
+        estimator_att, (0, 0, 0, cache_width - total_valid, 0, 0, 0, 0)
+    )
+    return estimator_att, total_valid
+
+
 def _zero_padded_frames(tensor: torch.Tensor, valid_frames: int | None) -> None:
     """Keep the padded columns of ``tensor`` at zero, in place.
 
@@ -354,6 +427,23 @@ class BatchedToken2Wav(nn.Module):
                 "CFM CUDA Graph bucketing enabled (bucket_frames=%d)",
                 self._cfm_graph_bucket_frames,
             )
+        # Cache-width bucket size for the estimator attention cache. The decode
+        # loop trims that cache to ``prompt_len + 100``, so every reference
+        # prompt length owns its own steady-state NPUGraph capture shape; with
+        # 8 concurrent requests that exhausts the default 32-entry graph limit
+        # and every later shape degrades to eager execution. Aligning the trim
+        # target up to this grid collapses nearby prompt lengths onto one
+        # capture shape (0 disables, e.g. when graphs are off).
+        self._cfm_graph_cache_bucket_frames = (
+            int(cfm_graph_cfg.get("cache_bucket_frames", 0))
+            if (self._cfm_graph_wrapper is not None or self._cfm_graph_enabled)
+            else 0
+        )
+        if self._cfm_graph_cache_bucket_frames > 1:
+            logger.info(
+                "CFM cache-width bucketing enabled (cache_bucket_frames=%d)",
+                self._cfm_graph_cache_bucket_frames,
+            )
         self._prompt_features: dict[tuple[str, str], PromptFeatures] = {}
         self._setup_cache_size = setup_cache_size
         self._setup_cache: OrderedDict[tuple[tuple[str, str], int, int], tuple[BatchedToken2WavState, ...]] = (
@@ -513,7 +603,11 @@ class BatchedToken2Wav(nn.Module):
         attn_mask: torch.Tensor | None = None,
         valid_lengths: list[int] | None = None,
         valid_frames: int | None = None,
+        att_sink: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # ``att_sink`` is consumed by the NPU graph patch only: the replayed
+        # attention output is copied straight into it instead of being cloned.
+        # Other paths (TRT stepper, CUDA wrapper, plain eager) ignore it.
         if self._trt_stepper is not None and valid_lengths is None:
             out, new_cnn, new_att = self._trt_stepper.step(
                 x=x,
@@ -680,6 +774,7 @@ class BatchedToken2Wav(nn.Module):
         cnn_cache: torch.Tensor | None,
         att_cache: torch.Tensor | None,
         valid_lengths: list[int] | None = None,
+        cache_valid: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -689,10 +784,15 @@ class BatchedToken2Wav(nn.Module):
         estimator = decoder.estimator
         batch_size = int(mu.shape[0])
         offset = int(att_cache.shape[4]) if att_cache is not None else 0
+        # Bucketed caches carry pad columns, so the physical kv width no
+        # longer tracks how much of the shared noise stream was consumed.
+        # The valid prefix count is the semantic stream position; rows share
+        # one value on the aligned even path (same enforced by the caller).
+        noise_offset = int(cache_valid[0]) if cache_valid is not None else offset
         mel_frames = int(mu.shape[2])
         pad_frames = _cfm_pad_frames(
             mel_frames=mel_frames,
-            offset=offset,
+            offset=noise_offset,
             noise_capacity=int(decoder.rand_noise.shape[2]),
             bucket_frames=self._cfm_graph_bucket_frames,
             disabled=(
@@ -713,14 +813,14 @@ class BatchedToken2Wav(nn.Module):
             # carry less of a step change into the attention and CNN caches.
             mu = torch.nn.functional.pad(mu, (0, pad_frames), mode="replicate")
             cond = torch.nn.functional.pad(cond, (0, pad_frames), mode="replicate")
-        end = offset + int(mu.shape[2])
+        end = noise_offset + int(mu.shape[2])
         if end > int(decoder.rand_noise.shape[2]):
             raise RuntimeError(
                 "MiniCPMO45Code2WavBatchError "
                 f'{{"reason":"noise_capacity","required":{end},'
                 f'"available":{int(decoder.rand_noise.shape[2])}}}'
             )
-        x = decoder.rand_noise[:, :, offset:end].expand(batch_size, -1, -1).clone()
+        x = decoder.rand_noise[:, :, noise_offset:end].expand(batch_size, -1, -1).clone()
         if pad_frames:
             # The padded columns would otherwise carry real noise values. They
             # are excluded from this chunk's attention by ``attn_mask`` below
@@ -741,6 +841,13 @@ class BatchedToken2Wav(nn.Module):
         speakers_cfg = torch.cat((speakers, torch.zeros_like(speakers)), dim=0)
         cond_cfg = torch.cat((cond, torch.zeros_like(cond)), dim=0)
         attn_mask = None
+        # Cache-width bucketing pads the attention cache up to the aligned
+        # capture width; the pad columns must be excluded from softmax just
+        # like the chunk padding below (a zero key still takes probability
+        # mass out of the denominator).
+        cache_pad_ok = _estimator_att_pad_columns(cache_valid, offset)
+        if cache_pad_ok is not None:
+            cache_pad_ok = torch.cat((cache_pad_ok, cache_pad_ok), dim=0).unsqueeze(1)
         if valid_lengths is not None:
             if len(valid_lengths) != batch_size:
                 raise ValueError(f"valid length count {len(valid_lengths)} != batch {batch_size}")
@@ -751,10 +858,14 @@ class BatchedToken2Wav(nn.Module):
             positions = torch.arange(int(mu.shape[2]), device=mu.device)
             valid_queries = positions.unsqueeze(0) < cfg_lengths.unsqueeze(1)
             current_keys = valid_queries.unsqueeze(1).expand(-1, int(mu.shape[2]), -1)
-            old_keys = torch.ones(
-                (2 * batch_size, int(mu.shape[2]), offset),
-                dtype=torch.bool,
-                device=mu.device,
+            old_keys = (
+                cache_pad_ok.expand(-1, int(mu.shape[2]), -1)
+                if cache_pad_ok is not None
+                else torch.ones(
+                    (2 * batch_size, int(mu.shape[2]), offset),
+                    dtype=torch.bool,
+                    device=mu.device,
+                )
             )
             attn_mask = valid_queries.unsqueeze(2) & torch.cat((current_keys, old_keys), dim=2)
         elif pad_frames:
@@ -771,6 +882,18 @@ class BatchedToken2Wav(nn.Module):
                 device=mu.device,
             )
             attn_mask[:, :, mel_frames : mel_frames + pad_frames] = False
+            if cache_pad_ok is not None:
+                attn_mask[:, :, mel_frames + pad_frames :] = cache_pad_ok
+        elif cache_pad_ok is not None:
+            kv_len = int(mu.shape[2]) + offset
+            attn_mask = torch.ones(
+                2 * batch_size,
+                int(mu.shape[2]),
+                kv_len,
+                dtype=torch.bool,
+                device=mu.device,
+            )
+            attn_mask[:, :, int(mu.shape[2]) :] = cache_pad_ok
         next_cnn: list[torch.Tensor] = []
         next_att_cache: torch.Tensor | None = None
         ragged_att_cache: list[torch.Tensor] | None = None
@@ -779,6 +902,14 @@ class BatchedToken2Wav(nn.Module):
             for step in range(self.n_timesteps):
                 old_cnn = cnn_cache[step] if cnn_cache is not None else None
                 old_att = att_cache[step] if att_cache is not None else None
+                # From the second step on, the graph-replayed attention output
+                # can be written straight into its streaming cache slot,
+                # skipping the per-step clone+copy pair (see NPUExactGraphRunner).
+                att_sink = (
+                    next_att_cache[step]
+                    if next_att_cache is not None and valid_lengths is None
+                    else None
+                )
                 estimate, step_cnn, step_att = self._estimator_step(
                     estimator,
                     x=torch.cat((x, x), dim=0),
@@ -791,7 +922,11 @@ class BatchedToken2Wav(nn.Module):
                     attn_mask=attn_mask,
                     valid_lengths=valid_lengths,
                     valid_frames=mel_frames if pad_frames else None,
+                    att_sink=att_sink,
                 )
+                if att_sink is not None and step_att is not att_sink:
+                    att_sink.copy_(step_att)
+                    step_att = att_sink
                 if pad_frames:
                     _zero_padded_cnn_cache(step_cnn, estimator, pad_frames)
                 conditional, unconditional = estimate.split(batch_size, dim=0)
@@ -837,7 +972,11 @@ class BatchedToken2Wav(nn.Module):
                         device=step_att.device,
                         dtype=self._estimator_att_cache_dtype,
                     )
-                next_att_cache[step].copy_(step_att)
+                if step_att is not next_att_cache[step]:
+                    # The first step (and any eager fallback) still returns an
+                    # independent tensor; graph-replayed steps with a sink have
+                    # already written their output into this slot.
+                    next_att_cache[step].copy_(step_att)
                 if pad_frames:
                     # The padded steps ran but hold no valid content, and each
                     # cache entry becomes the next chunk's keys. Clear the
@@ -851,6 +990,14 @@ class BatchedToken2Wav(nn.Module):
             return x, torch.stack(next_cnn), ragged_att_cache
         assert next_att_cache is not None
         return x, torch.stack(next_cnn), next_att_cache
+
+    def _estimator_cache_width(self, prompt_len: int) -> int:
+        """Physical width of the estimator attention cache for one request.
+
+        Equal to the legacy ``prompt_len + 100`` trim target when cache
+        bucketing is off; otherwise aligned up to the capture-shape grid.
+        """
+        return _cache_align_width(prompt_len + 100, self._cfm_graph_cache_bucket_frames)
 
     def _split_flow_cache(self, cache: dict[str, torch.Tensor], batch_size: int) -> list[dict[str, torch.Tensor]]:
         result: list[dict[str, torch.Tensor]] = []
@@ -888,6 +1035,10 @@ class BatchedToken2Wav(nn.Module):
                     "estimator_att_cache": request_att,
                 }
             )
+        if "estimator_att_cache_valid" in cache:
+            valid = cache["estimator_att_cache_valid"]
+            for row in range(batch_size):
+                result[row]["estimator_att_cache_valid"] = valid[row : row + 1].detach().clone()
         return result
 
     def _stack_flow_cache(self, states: list[BatchedToken2WavState]) -> dict[str, torch.Tensor]:
@@ -897,12 +1048,16 @@ class BatchedToken2Wav(nn.Module):
         conditional_att = [flow["estimator_att_cache"][:, :, 0:1] for flow in flows]
         unconditional_att = [flow["estimator_att_cache"][:, :, 1:2] for flow in flows]
         estimator_att = torch.cat((*conditional_att, *unconditional_att), dim=2)
-        return {
+        stacked = {
             "conformer_cnn_cache": torch.cat([flow["conformer_cnn_cache"] for flow in flows], dim=0),
             "conformer_att_cache": torch.cat([flow["conformer_att_cache"] for flow in flows], dim=1),
             "estimator_cnn_cache": torch.cat((*conditional_cnn, *unconditional_cnn), dim=2),
             "estimator_att_cache": estimator_att,
         }
+        valid = [flow.get("estimator_att_cache_valid") for flow in flows]
+        if all(item is not None for item in valid):
+            stacked["estimator_att_cache_valid"] = torch.cat(valid, dim=0)
+        return stacked
 
     def _create_initial_states(
         self,
@@ -930,12 +1085,36 @@ class BatchedToken2Wav(nn.Module):
                 cnn_cache=None,
                 att_cache=None,
             )
+        prompt_len = int(prompt_mels.shape[1])
+        cache_width = self._estimator_cache_width(prompt_len)
+        # The aligned capture grid only pays off while graph replay is active
+        # AND the cache-grid bucketing is actually configured. With padding
+        # disabled the cache must keep its legacy (unpadded) width so
+        # shape-keyed caches keep the same miss pattern as before bucketing
+        # existed.
+        aligned_active = self._cfm_graph_cache_bucket_frames > 1 and (
+            (self._cfm_graph_wrapper is not None and self._cfm_graph_wrapper.enabled)
+            or (self._cfm_graph_wrapper is None and self._cfm_graph_enabled)
+        )
+        if aligned_active and cache_width > int(estimator_att.shape[4]):
+            # Pad once at setup so the capture shape is stable from the first
+            # decode chunk; the pad columns are masked until the decode loop
+            # overwrites them. The kv axis is dim 4 of the 6-D cache; F.pad's
+            # tuple starts at the last axis, hence the 8-element form.
+            estimator_att = torch.nn.functional.pad(
+                estimator_att,
+                (0, 0, 0, cache_width - int(estimator_att.shape[4]), 0, 0, 0, 0),
+            )
         flow_cache = {
             "conformer_cnn_cache": conformer_cnn,
             "conformer_att_cache": conformer_att,
             "estimator_cnn_cache": estimator_cnn,
             "estimator_att_cache": estimator_att,
         }
+        if aligned_active and cache_width > prompt_len:
+            flow_cache["estimator_att_cache_valid"] = estimator_att.new_full(
+                (batch_size,), prompt_len, dtype=torch.long
+            )
         split = self._split_flow_cache(flow_cache, batch_size)
         mel_channels = int(prompt_mels.shape[2])
         return [
@@ -959,7 +1138,7 @@ class BatchedToken2Wav(nn.Module):
         )
         # Capture the policy before setup: graph capture may disable the wrapper
         # after padding has already been chosen for these initial states.
-        cache_key = (features.cache_key, batch_size, bucket_frames)
+        cache_key = (features.cache_key, batch_size, bucket_frames, self._cfm_graph_cache_bucket_frames)
         cached = self._setup_cache.get(cache_key)
         if cached is not None:
             self._setup_cache.move_to_end(cache_key)
@@ -1085,28 +1264,52 @@ class BatchedToken2Wav(nn.Module):
                 cond,
                 cnn_cache=flow_cache["estimator_cnn_cache"],
                 att_cache=flow_cache["estimator_att_cache"],
+                cache_valid=flow_cache.get("estimator_att_cache_valid"),
             )
 
         prompt_len = int(features.mels.shape[1])
-        if estimator_att.shape[4] > prompt_len + 100:
-            estimator_att = torch.cat(
-                (estimator_att[..., :prompt_len, :], estimator_att[..., -100:, :]),
-                dim=4,
+        cache_width = self._estimator_cache_width(prompt_len)
+        prev_valid = flow_cache.get("estimator_att_cache_valid")
+        if (
+            prev_valid is not None
+            and int(prev_valid.numel()) == batch_size
+            and bool((prev_valid == prev_valid[0]).all())
+        ):
+            # Aligned path: the input cache is padded to ``cache_width`` and
+            # ``prev_valid`` marks its valid prefix. Drop the pad columns,
+            # trim to [prompt prefix | tail ``keep`` valid frames] and pad
+            # back to ``cache_width`` so the capture shape stays constant.
+            estimator_att, new_valid = _align_estimator_cache(
+                estimator_att,
+                prompt_len,
+                cache_width,
+                int(prev_valid[0]),
+                int(flow_cache["estimator_att_cache"].shape[4]),
             )
+            new_valid_cache = torch.full(
+                (batch_size,), new_valid, dtype=torch.long, device=estimator_att.device
+            )
+        else:
+            if estimator_att.shape[4] > prompt_len + 100:
+                estimator_att = torch.cat(
+                    (estimator_att[..., :prompt_len, :], estimator_att[..., -100:, :]),
+                    dim=4,
+                )
+            new_valid_cache = None
         if conformer_att.shape[3] > prompt_len + 100:
             conformer_att = torch.cat(
                 (conformer_att[..., :prompt_len, :], conformer_att[..., -100:, :]),
                 dim=3,
             )
-        new_flow = self._split_flow_cache(
-            {
-                "conformer_cnn_cache": conformer_cnn,
-                "conformer_att_cache": conformer_att,
-                "estimator_cnn_cache": estimator_cnn,
-                "estimator_att_cache": estimator_att,
-            },
-            batch_size,
-        )
+        new_flow_dict = {
+            "conformer_cnn_cache": conformer_cnn,
+            "conformer_att_cache": conformer_att,
+            "estimator_cnn_cache": estimator_cnn,
+            "estimator_att_cache": estimator_att,
+        }
+        if new_valid_cache is not None:
+            new_flow_dict["estimator_att_cache_valid"] = new_valid_cache
+        new_flow = self._split_flow_cache(new_flow_dict, batch_size)
         old_mel = torch.cat([state.hift_cache["mel"] for state in states], dim=0)
         old_source = torch.cat([state.hift_cache["source"] for state in states], dim=0)
         old_speech = torch.cat([state.hift_cache["speech"] for state in states], dim=0)
@@ -1241,16 +1444,31 @@ class BatchedToken2Wav(nn.Module):
                 cnn_cache=flow_cache["estimator_cnn_cache"],
                 att_cache=flow_cache["estimator_att_cache"],
                 valid_lengths=hidden_lengths,
+                cache_valid=flow_cache.get("estimator_att_cache_valid"),
             )
 
         prompt_len = int(features.mels.shape[1])
+        cache_width = self._estimator_cache_width(prompt_len)
+        ragged_cache_valid = flow_cache.get("estimator_att_cache_valid")
         assert isinstance(estimator_att, list)
         new_flow: list[dict[str, torch.Tensor]] = []
         for row, row_estimator_att in enumerate(estimator_att):
             conformer_cnn = conformer_cnn_rows[row]
             conformer_att = conformer_att_rows[row]
             assert conformer_cnn is not None and conformer_att is not None
-            if row_estimator_att.shape[4] > prompt_len + 100:
+            row_new_valid: int | None = None
+            if ragged_cache_valid is not None:
+                # Same aligned trim as ``_decode_batch_once``: drop the pad
+                # columns, keep [prompt prefix | tail ``keep`` valid frames]
+                # and pad back so the state stays on the capture grid.
+                row_estimator_att, row_new_valid = _align_estimator_cache(
+                    row_estimator_att,
+                    prompt_len,
+                    cache_width,
+                    int(ragged_cache_valid[row]),
+                    int(flow_cache["estimator_att_cache"].shape[4]),
+                )
+            elif row_estimator_att.shape[4] > prompt_len + 100:
                 row_estimator_att = torch.cat(
                     (
                         row_estimator_att[..., :prompt_len, :],
@@ -1266,20 +1484,23 @@ class BatchedToken2Wav(nn.Module):
                     ),
                     dim=3,
                 )
-            new_flow.append(
-                {
-                    "conformer_cnn_cache": conformer_cnn.detach().clone(),
-                    "conformer_att_cache": conformer_att.detach().clone(),
-                    "estimator_cnn_cache": torch.cat(
-                        (
-                            estimator_cnn[:, :, row : row + 1],
-                            estimator_cnn[:, :, batch_size + row : batch_size + row + 1],
-                        ),
-                        dim=2,
-                    ).detach(),
-                    "estimator_att_cache": row_estimator_att,
-                }
-            )
+            row_flow = {
+                "conformer_cnn_cache": conformer_cnn.detach().clone(),
+                "conformer_att_cache": conformer_att.detach().clone(),
+                "estimator_cnn_cache": torch.cat(
+                    (
+                        estimator_cnn[:, :, row : row + 1],
+                        estimator_cnn[:, :, batch_size + row : batch_size + row + 1],
+                    ),
+                    dim=2,
+                ).detach(),
+                "estimator_att_cache": row_estimator_att,
+            }
+            if row_new_valid is not None:
+                row_flow["estimator_att_cache_valid"] = row_estimator_att.new_full(
+                    (1,), row_new_valid, dtype=torch.long
+                )
+            new_flow.append(row_flow)
 
         audios: list[torch.Tensor | None] = [None] * batch_size
         next_states: list[BatchedToken2WavState | None] = [None] * batch_size

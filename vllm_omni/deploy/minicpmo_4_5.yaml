@@ -35,6 +35,11 @@ connectors:
       # pool reusable; it needs CFM graph capture enabled above, and applies on
       # CUDA and NPU alike.
       cfm_graph_bucket_frames: 16
+      # Align the estimator attention cache onto the same capture grid: the
+      # physical kv width stays constant per request, so graph capture happens
+      # once per request instead of once per new chunk width (第 71 项, i71:
+      # RTF c1/c4/c8 −28.9%/−17.3%/−18.0% vs B0, WER 1.2179% unchanged).
+      cache_bucket_frames: 64
 
 stages:
   - stage_id: 0
@@ -159,7 +164,9 @@ platforms:
       - stage_id: 2
         max_num_seqs: 8
         # Stage 2 stays outer-eager and captures only exact-shape CFM DiT
-        # estimator kernels through the NPU platform patch.
+        # estimator kernels through the NPU platform patch. Pool 64 matches
+        # the B0 baseline footprint measured for 第 71 项 (i71 peak usage
+        # 33/64 graphs, no OOM at c8).
         additional_config:
           code2wav_enable_npu_graph: true
-          code2wav_max_npu_graphs: 32
+          code2wav_max_npu_graphs: 64

@@ -276,6 +276,9 @@ class MiniCPMO45Code2Wav(nn.Module):
             "enabled": bool(extra.get("enable_cfm_graph", False)),
             "max_graphs": int(extra.get("cfm_max_graphs", 32)),
             "bucket_frames": int(extra.get("cfm_graph_bucket_frames", 0)),
+            # Grid for the steady-state attention cache width (prompt+100
+            # trimmed). Collapses per-request capture shapes onto buckets.
+            "cache_bucket_frames": int(extra.get("cfm_graph_cache_bucket_frames", 0)),
         }
         self._ref_max_seconds = float(extra.get("ref_audio_max_seconds", _REF_MAX_SECONDS))
         if self._ref_max_seconds <= 0:

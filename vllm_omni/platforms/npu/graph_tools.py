@@ -24,14 +24,31 @@ class CapturedDeviceGraph:
     static_inputs: tuple[torch.Tensor, ...]
     static_outputs: tuple[torch.Tensor, ...]
 
-    def replay(self, inputs: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
+    def replay(
+        self,
+        inputs: tuple[torch.Tensor, ...],
+        output_into: tuple[torch.Tensor | None, ...] | None = None,
+    ) -> tuple[torch.Tensor, ...]:
         with torch.inference_mode():
             for static, current in zip(self.static_inputs, inputs, strict=True):
                 static.copy_(current)
             self.graph.replay()
             # Graph outputs are persistent and overwritten by the next replay.
-            # Clone before they become request-owned streaming cache entries.
-            return tuple(output.detach().clone() for output in self.static_outputs)
+            # Clone before they become request-owned streaming cache entries;
+            # when ``output_into`` supplies a caller-owned buffer for an output
+            # slot, copy straight into it instead (same stream, so the static
+            # buffer stays valid until the copy is issued). The clone skips one
+            # large allocation + copy per replayed step, which would otherwise
+            # hit the allocator between every estimator step.
+            if output_into is None:
+                return tuple(output.detach().clone() for output in self.static_outputs)
+            outputs: list[torch.Tensor] = []
+            for destination, output in zip(output_into, self.static_outputs, strict=True):
+                # Slots without a caller buffer must still clone: the static
+                # buffer is overwritten by the next replay and must not leak
+                # out as if it were request-owned.
+                outputs.append(output.detach().clone() if destination is None else destination.copy_(output))
+            return tuple(outputs)
 
 
 def _tensor_signature(value: torch.Tensor) -> tuple[tuple[int, ...], str, str]:
@@ -126,6 +143,7 @@ class NPUExactGraphRunner:
         inputs: tuple[torch.Tensor, ...],
         constants: tuple[object, ...],
         compute: Callable[..., tuple[torch.Tensor, ...]],
+        output_into: tuple[torch.Tensor | None, ...] | None = None,
     ) -> tuple[torch.Tensor, ...]:
         if self._failed_keys:
             raise RuntimeError(
@@ -145,7 +163,11 @@ class NPUExactGraphRunner:
             self._hits += 1
             if self._hits == 1:
                 logger.info("%s started NPUGraph replay", self.component_name)
-            return graph.replay(inputs)
+            # Pass the sink tuple only when present: graph objects with the
+            # pre-sink replay() signature keep working on the common path.
+            if output_into is None:
+                return graph.replay(inputs)
+            return graph.replay(inputs, output_into)
 
         # Prime lazy kernels and allocator state before capture. The next call
         # with the same exact tensor signature replays this graph.

@@ -115,6 +115,7 @@ def _patched_estimator_step(
     attn_mask=None,
     valid_lengths=None,
     valid_frames=None,
+    att_sink=None,
 ):
     assert _original_estimator_step is not None
     graph_runner = _backend_graph_runners.get(self)
@@ -183,6 +184,11 @@ def _patched_estimator_step(
             ),
         )
 
+    # Direct the attention-cache output straight into the caller-owned buffer
+    # when provided, skipping the per-step clone + copy pair. Only pass the
+    # slot when a sink exists so runners with the older run() signature keep
+    # working on the common path.
+    run_kwargs = {"output_into": (None, None, att_sink)} if att_sink is not None else {}
     return graph_runner.run(
         "cfm_estimator",
         (x, mu, time_embedding, speakers, cond, cnn_cache, att_cache, *mask_inputs),
@@ -199,6 +205,7 @@ def _patched_estimator_step(
             att_cache=step_att,
             **_step_kwargs(rest),
         ),
+        **run_kwargs,
     )
 
 
