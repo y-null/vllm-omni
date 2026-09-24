@@ -39,7 +39,7 @@ connectors:
       # physical kv width stays constant per request, so graph capture happens
       # once per request instead of once per new chunk width (第 71 项, i71:
       # RTF c1/c4/c8 −28.9%/−17.3%/−18.0% vs B0, WER 1.2179% unchanged).
-      cache_bucket_frames: 64
+      cfm_graph_cache_bucket_frames: 64
 
 stages:
   - stage_id: 0
