@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from collections.abc import Mapping
 from contextlib import nullcontext
@@ -99,6 +100,52 @@ def _graphable_estimator_step(
         att_out,
     )
     return result, cnn_out, att_out
+
+
+_TS_FREQS_CACHE: dict[tuple[int, float, str, str, str], torch.Tensor] = {}
+_TS_FREQS_PATCHED = False
+
+
+def _install_timestep_freqs_cache() -> bool:
+    """第 57 项（2026-09-21 实现，2026-09-30 第 58 轮 A/B/A 夹逼后采纳）：
+    把 DiT 时间步嵌入里的 `freqs` 张量缓存到设备上。
+
+    上游每次调用都执行 ``torch.exp(-log(max_period) * torch.arange(half) / half).to(t)``：
+    ``torch.arange`` 建在 CPU 上，``.to(t)`` 再把它搬上设备 —— 每一步一次同步搬运。
+    第 56 项探针实测：CFM 每次调用走 10 步，其中约 195ms 花在这个嵌入上（图回放本身
+    只要 0.44ms/步）；卡上 2670 步对应 ``aclrtSynchronizeStream`` 实测 4788 次。
+
+    ``freqs`` 只取决于 (half, max_period, 默认 dtype, t 的设备与 dtype)，与 t 的取值无关，
+    所以只算一次。缓存前后逐位相同（同一算式、同一 dtype、同一设备），无音质风险。
+
+    采纳依据（第 58 轮 A/B/A，median 口径）：c4 0.7090 vs A/A' 0.7787/0.7665 = -8.2%
+    （超 5% 门槛与 ±3% 分辨力）；c1 -1.6% 中性；c8 -4.3% 在 ±11% 分辨力内。
+    """
+    global _TS_FREQS_PATCHED
+    if _TS_FREQS_PATCHED:
+        return True
+    try:
+        from cosyvoice2.flow.decoder_dit import TimestepEmbedder
+    except Exception:  # noqa: BLE001 - 不是 cosyvoice2 环境就安静跳过
+        return False
+
+    def _cached_timestep_embedding(t, dim, max_period=10000):
+        half = dim // 2
+        key = (half, float(max_period), str(torch.get_default_dtype()), str(t.device), str(t.dtype))
+        freqs = _TS_FREQS_CACHE.get(key)
+        if freqs is None:
+            freqs = torch.exp(-math.log(max_period) * torch.arange(start=0, end=half) / half).to(t)
+            _TS_FREQS_CACHE[key] = freqs
+        args = t[:, None] * freqs[None]
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        if dim % 2:
+            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+        return embedding
+
+    TimestepEmbedder.timestep_embedding = staticmethod(_cached_timestep_embedding)
+    _TS_FREQS_PATCHED = True
+    logger.info("MiniCPM-o Code2Wav: cached the DiT timestep freqs on device (第 57 项)")
+    return True
 
 
 def _patched_estimator_step(
@@ -313,5 +360,7 @@ def apply_minicpmo_4_5_code2wav_patch() -> None:
     BatchedToken2Wav._estimator_step = _patched_estimator_step  # type: ignore[method-assign]
     BatchedToken2Wav.setup_batch = _patched_setup_batch  # type: ignore[method-assign]
     BatchedToken2Wav.decode_batch = _patched_decode_batch  # type: ignore[method-assign]
+    _install_timestep_freqs_cache()
+
     _PATCHED = True
     logger.debug("Applied NPU patch for MiniCPM-o 4.5 Code2Wav")
