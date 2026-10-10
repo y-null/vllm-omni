@@ -639,6 +639,31 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 dict(num_scheduled_tokens),
             )
 
+    def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
+        """Rewrite the K-step spans before upstream books the step.
+
+        ``_enforce_kstep_span_uniformity`` can shrink rows the static-shape
+        multi-frame loop refuses to execute. Upstream books the step here --
+        ``_update_after_schedule`` is the last thing its ``schedule()`` does
+        (vllm/v1/core/sched/scheduler.py:1516) -- advancing
+        ``num_computed_tokens`` *and* ``num_in_flight_tokens`` by the span each
+        request was scheduled for, while ``update_from_output`` drains only
+        what the dispatched output says (:2023). Rewriting after that point
+        left every shrunk row carrying ``booked - 1`` tokens in flight for
+        good and handed the next admission an inflated computed count: two
+        requests booked 8/4 with drafts and executed as 1/1 settled at 108/104
+        instead of 101/101 (review on #7929).
+
+        Running ahead of the upstream body makes it book exactly the spans
+        that are dispatched, so no request state has to be reconciled
+        afterwards. Every path that books reaches this method -- upstream's
+        ``schedule()`` and the generation fast path both call it -- and the
+        call site in ``schedule()`` below stays as a backstop for a step built
+        without booking, where there is no accounting to settle.
+        """
+        self._enforce_kstep_span_uniformity(scheduler_output)
+        super()._update_after_schedule(scheduler_output)
+
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         # Remove FINISHED_ABORTED requests before the upstream scheduler sees
         # them. Upstream vllm raises RuntimeError on this status; omni allows
@@ -679,6 +704,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 self.waiting, self.kv_holding_waiting = original_wait_queues
             self._restore_omni_wait_queues()
 
+        # Backstop: a step built without ``_update_after_schedule`` (nothing
+        # booked, so nothing to reconcile) still leaves here uniform. On the
+        # booking paths the rewrite already ran ahead of the booking and this
+        # call finds uniform spans and returns.
         self._enforce_kstep_span_uniformity(scheduler_output)
         self._postprocess_omni_schedule_output(
             scheduler_output,

@@ -225,7 +225,47 @@ def _sched_out(num_scheduled: dict, spec: dict):
         num_scheduled_tokens=num_scheduled,
         scheduled_spec_decode_tokens=spec,
         total_num_scheduled_tokens=sum(num_scheduled.values()),
+        # Real SchedulerOutput field: upstream's bookkeeping ORs into it.
+        has_structured_output_requests=False,
     )
+
+
+def test_the_rewrite_books_the_span_that_runs():
+    """The rewrite must land *before* upstream books the step (P1 on #7929).
+
+    Upstream advances ``num_computed_tokens`` and ``num_in_flight_tokens`` by
+    the scheduled span inside ``_update_after_schedule`` -- the last thing its
+    ``schedule()`` does (vllm/v1/core/sched/scheduler.py:1516) -- while
+    ``update_from_output`` drains only what the dispatched output says
+    (:2023). Rewriting afterwards left every shrunk row carrying
+    ``booked - 1`` tokens in flight for good and an inflated computed count for
+    the next admission to book from: two requests booked 8/4 and executed as
+    1/1 settled at 108/104 instead of 101/101. Running the upstream body here
+    asserts both halves at once -- the spans it books and the ledger it moves.
+    """
+    good = _req(computed=100, prompt=100, spec=[0] * 7, total=108, req_id="good")
+    stale = _req(computed=100, prompt=100, spec=[0] * 3, total=104, req_id="stale")
+    sched = _make_scheduler(num_spec=7, waiting=[], running=[good, stale])
+    out = _sched_out({"good": 8, "stale": 4}, {"good": [0] * 7, "stale": [0] * 3})
+
+    # The bookkeeping half of the scheduler: what upstream's body reads.
+    for req in (good, stale):
+        req.num_in_flight_tokens = 0
+        req.num_output_placeholders = 0
+        req.use_structured_output = False
+    sched.requests = {req.request_id: req for req in (good, stale)}
+    sched.defer_block_free = False
+    sched._inflight_prefills = set()
+    sched.finished_req_ids = set()
+    sched.reset_preempted_req_ids = set()
+
+    sched._update_after_schedule(out)
+
+    assert out.num_scheduled_tokens == {"good": 1, "stale": 1}
+    assert out.scheduled_spec_decode_tokens == {}
+    for req in (good, stale):
+        assert req.num_computed_tokens == 101, "booked span leaked into the ledger"
+        assert req.num_in_flight_tokens == 1, "booked span stayed in flight"
 
 
 def test_enforce_drops_uneven_decode_spans_to_single_frame():
