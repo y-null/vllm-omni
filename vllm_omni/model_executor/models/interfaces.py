@@ -44,12 +44,22 @@ class SupportsMultiFrameDecode(Protocol):
     def merge_frame_outputs(self, frame_outputs: list[Any], frame_stop_logits: list[Any]) -> Any: ...
 
 
+# The members a runner actually calls, spelled out instead of read off the
+# Protocol: ``SupportsMultiFrameDecode.__protocol_attrs__`` is only filled in on
+# Python 3.12+ (typing._get_protocol_attrs sets it when the class is created),
+# while this package supports 3.10 (pyproject requires-python >=3.10), where the
+# lookup raised AttributeError for every model that armed the flag. The gate
+# below and test_runner_contract.py keep this tuple and the Protocol in step.
+_REQUIRED_MULTI_FRAME_MEMBERS: tuple[str, ...] = (
+    "batch_stop_logits",
+    "take_batch_stop_logits",
+    "set_batch_stop_logits",
+    "merge_frame_outputs",
+)
+
+
 def _missing_members(model: Any, names: tuple[str, ...]) -> list[str]:
-    missing = [name for name in names if not hasattr(model, name)]
-    # Protocol members declared as annotations are not real attributes, so a
-    # data-only member is satisfied by the flag itself; the methods below are
-    # the ones a missing forward would actually hide.
-    return [name for name in missing if name != "supports_multi_frame_decode"]
+    return [name for name in names if not hasattr(model, name)]
 
 
 def supports_multi_frame_decode(model: Any) -> bool:
@@ -64,7 +74,7 @@ def supports_multi_frame_decode(model: Any) -> bool:
     flag = getattr(model, "supports_multi_frame_decode", False)
     if not flag:
         return False
-    missing = _missing_members(model, SupportsMultiFrameDecode.__protocol_attrs__)
+    missing = _missing_members(model, _REQUIRED_MULTI_FRAME_MEMBERS)
     if missing:
         raise TypeError(
             f"{type(model).__name__} advertises supports_multi_frame_decode but does not provide "

@@ -67,6 +67,46 @@ def test_flag_off_reads_false_without_contract():
     assert supports_multi_frame_decode(SimpleNamespace()) is False
 
 
+def test_gate_does_not_read_the_protocol_attributes(monkeypatch):
+    """P2 on #7929: the gate read ``Protocol.__protocol_attrs__``.
+
+    ``typing`` fills that attribute when the Protocol class is created, and
+    only from Python 3.12 on: 3.10 and 3.11 leave it absent, so every model
+    that armed the flag raised AttributeError instead of being checked. The
+    package declares ``requires-python = ">=3.10"``. An object that answers
+    nothing is what a 3.10 interpreter looks like to this gate.
+    """
+    from vllm_omni.model_executor.models import interfaces
+
+    class _NoProtocolAttrs:
+        def __getattr__(self, name):
+            raise AttributeError(name)
+
+    monkeypatch.setattr(interfaces, "SupportsMultiFrameDecode", _NoProtocolAttrs())
+
+    assert interfaces.supports_multi_frame_decode(_Model(armed=True)) is True
+    with pytest.raises(TypeError) as excinfo:
+        interfaces.supports_multi_frame_decode(SimpleNamespace(supports_multi_frame_decode=True))
+    assert "batch_stop_logits" in str(excinfo.value)
+
+
+def test_required_members_covers_the_protocol():
+    """The explicit member list has to track the Protocol.
+
+    Spelled out because ``__protocol_attrs__`` is 3.12+, so a new Protocol
+    member added without updating the list would silently go unverified.
+    """
+    from vllm_omni.model_executor.models.interfaces import _REQUIRED_MULTI_FRAME_MEMBERS
+
+    declared = {
+        name
+        for name in (*vars(SupportsMultiFrameDecode), *SupportsMultiFrameDecode.__annotations__)
+        if not name.startswith("_")
+    }
+    # The flag is the gate itself, not a member the gate verifies.
+    assert declared - {"supports_multi_frame_decode"} == set(_REQUIRED_MULTI_FRAME_MEMBERS)
+
+
 def test_flag_on_without_members_raises_and_names_them():
     model = SimpleNamespace(supports_multi_frame_decode=True)
     with pytest.raises(TypeError) as excinfo:
