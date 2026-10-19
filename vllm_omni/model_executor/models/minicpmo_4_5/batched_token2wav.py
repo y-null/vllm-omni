@@ -47,6 +47,8 @@ _S2BD_CALLS = [0]
 # 第 99 项：hift eager 发射开销实验开关（stage 子进程 env 治理会滤掉自定义
 # 变量，实验臂靠代码内默认值翻转；测毕回退默认 False）。
 _HIFT_COMPILE = _os_bd.environ.get("VLLM_OMNI_HIFT_COMPILE") == "1"
+# 第 101 项：hift NPU 平台图回放（_inference_pre_istft 体）实验开关。
+_HIFT_NPU_GRAPH = _os_bd.environ.get("VLLM_OMNI_HIFT_NPU_GRAPH", "1") == "1"  # 实验臂默认开
 
 _SILENCE_TOKEN = 4218
 # CosyVoice2 RelPos PE is built for max_len=5000 and `forward_chunk` never
@@ -403,6 +405,20 @@ class BatchedToken2Wav(nn.Module):
         self._hift_compiled = None  # 第 99 项：lazy compile 的 hift.inference
         self._split_order_2n: dict[int, torch.Tensor] = {}  # 第 100 项：split 重排索引缓存
         self._split_order_row: dict[int, torch.Tensor] = {}
+        # 第 101 项：NPU 平台图 runner（仅 _inference_pre_istft 纯张量体）。
+        self._hift_graph_runner = None
+        if hift_parameter is not None and hift_parameter.device.type == "npu" and _HIFT_NPU_GRAPH:
+            try:
+                from vllm_omni.platforms.npu.graph_tools import NPUExactGraphRunner
+
+                if NPUExactGraphRunner.is_supported():
+                    self._hift_graph_runner = NPUExactGraphRunner(
+                        max_graphs=8,
+                        component_name="hift_pre_istft",
+                        disable_config_hint="disable hift npu graph",
+                    )
+            except Exception as exc:  # pragma: no cover - 平台差异兜底
+                logger.warning("HiFT NPU graph runner unavailable: %s", exc)
         graph_config = dict(hift_graph_config or {})
         if bool(graph_config.get("enabled", False)):
             if hift_parameter is None:
@@ -488,10 +504,20 @@ class BatchedToken2Wav(nn.Module):
         source_cache: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.hift_graph_wrapper is None:
-            # 第 99 项（实验，env 门控）：NPU 上 HiFT 图回放未接平台路径
-            # （batched_token2wav.py:407 device.type 检查），hift 全程 eager，
-            # 发射开销占 stage2 叶子热点 ~24%（linear/conv/snake/layernorm）。
-            # inductor 编译整段 inference 融合小 op，消发射。默认关。
+            # 第 101 项：NPU 上复刻 CFM 的 platform graph 接线——把纯张量体
+            # _inference_pre_istft（f0 predictor + source + decode conv 栈，hift
+            # eager 发射热点的大头）交给 NPUExactGraphRunner 按 (形状,cache长度)
+            # 键控捕获/回放；istft（_finalize_decode）留在图外。CFM 已证同款
+            # runner 在本栈稳定。实验门控 _HIFT_NPU_GRAPH，测毕定默认值。
+            if self._hift_graph_runner is not None:
+                magnitude, phase, s = self._hift_graph_runner.run(
+                    "hift_pre_istft",
+                    (mel, source_cache),
+                    (),
+                    lambda m, c: self.hift._inference_pre_istft(m, c),
+                )
+                return self.hift._finalize_decode(magnitude, phase), s
+            # 第 99 项（实验，env 门控）：inductor 编译整段 inference。默认关。
             if _HIFT_COMPILE and self._hift_compiled is None:
                 self._hift_compiled = torch.compile(self.hift.inference, dynamic=False)
             if self._hift_compiled is not None:
