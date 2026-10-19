@@ -19,6 +19,35 @@ from .cuda_graph_wrapper import CFMGraphWrapper, HiFTGraphWrapper
 
 logger = init_logger(__name__)
 
+# 第 98 项诊断探针（P55/P94 同族，env 门控零开销）：stage2 ragged decode 的
+# 宿主侧分段账单。VLLM_OMNI_S2_BREAKDOWN=1 时启用，每 32 次 decode 打印一次
+# 聚合（单位 ms）。grep 关键字 S2BD。
+import os as _os_bd
+import time as _time_bd
+
+_perf = _time_bd.perf_counter
+_S2BD = _os_bd.environ.get("VLLM_OMNI_S2_BREAKDOWN") == "1"
+_S2BD_KEYS = ("encoder", "cfm", "flow_tail", "hift_vocoder", "glue", "overlong_fallback")
+_S2BD_ACC = {k: [0.0, 0] for k in _S2BD_KEYS}
+
+
+def _s2bd_flush():
+    total = sum(v[0] for v in _S2BD_ACC.values())
+    parts = " ".join(
+        f"{k}={v[0]:.1f}ms(n={v[1]})" for k, v in _S2BD_ACC.items() if v[1] > 0
+    )
+    print(f"S2BD calls={_S2BD_CALLS[0]} total={total:.1f}ms {parts}", flush=True)
+    for v in _S2BD_ACC.values():
+        v[0] = 0.0
+        v[1] = 0
+
+
+_S2BD_CALLS = [0]
+
+# 第 99 项：hift eager 发射开销实验开关（stage 子进程 env 治理会滤掉自定义
+# 变量，实验臂靠代码内默认值翻转；测毕回退默认 False）。
+_HIFT_COMPILE = _os_bd.environ.get("VLLM_OMNI_HIFT_COMPILE") == "1"
+
 _SILENCE_TOKEN = 4218
 # CosyVoice2 RelPos PE is built for max_len=5000 and `forward_chunk` never
 # calls ``extend_pe``. After the 2x upsample a single Code2Wav prefill longer
@@ -371,6 +400,9 @@ class BatchedToken2Wav(nn.Module):
             persistent=False,
         )
         self.hift_graph_wrapper: HiFTGraphWrapper | None = None
+        self._hift_compiled = None  # 第 99 项：lazy compile 的 hift.inference
+        self._split_order_2n: dict[int, torch.Tensor] = {}  # 第 100 项：split 重排索引缓存
+        self._split_order_row: dict[int, torch.Tensor] = {}
         graph_config = dict(hift_graph_config or {})
         if bool(graph_config.get("enabled", False)):
             if hift_parameter is None:
@@ -456,6 +488,14 @@ class BatchedToken2Wav(nn.Module):
         source_cache: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if self.hift_graph_wrapper is None:
+            # 第 99 项（实验，env 门控）：NPU 上 HiFT 图回放未接平台路径
+            # （batched_token2wav.py:407 device.type 检查），hift 全程 eager，
+            # 发射开销占 stage2 叶子热点 ~24%（linear/conv/snake/layernorm）。
+            # inductor 编译整段 inference 融合小 op，消发射。默认关。
+            if _HIFT_COMPILE and self._hift_compiled is None:
+                self._hift_compiled = torch.compile(self.hift.inference, dynamic=False)
+            if self._hift_compiled is not None:
+                return self._hift_compiled(mel, source_cache)
             return self.hift.inference(mel, source_cache)
         return self.hift_graph_wrapper.replay(mel, source_cache)
 
@@ -1000,45 +1040,47 @@ class BatchedToken2Wav(nn.Module):
         return _cache_align_width(prompt_len + 100, self._cfm_graph_cache_bucket_frames)
 
     def _split_flow_cache(self, cache: dict[str, torch.Tensor], batch_size: int) -> list[dict[str, torch.Tensor]]:
+        # 第 100 项：原实现每行发射 1-2 次 cat + 2 次 clone（batch=32 时 ~128 次
+        # 小 kernel 发射，S2BD 账单 flow_tail 段 ~120ms/批）。改为每键一次
+        # index_select 批量重排（cfg 交错序 [row0, batch+row0, row1, ...]），
+        # 再零开销切片。index_select 产生新 buffer，等价原 clone 的图输出隔离。
+        if batch_size == 0:
+            return []
+        att = cache["estimator_att_cache"]
+        dev = att.device
+        order_2n = self._split_order_2n.get(batch_size)
+        if order_2n is None or order_2n.device != dev:
+            order_2n = torch.tensor(
+                [i for row in range(batch_size) for i in (row, batch_size + row)],
+                device=dev,
+                dtype=torch.long,
+            )
+            self._split_order_2n[batch_size] = order_2n
+        order_row = self._split_order_row.get(batch_size)
+        if order_row is None or order_row.device != dev:
+            order_row = torch.arange(batch_size, device=dev, dtype=torch.long)
+            self._split_order_row[batch_size] = order_row
+        if att.dtype == self._estimator_att_cache_dtype:
+            att_split = att.index_select(2, order_2n).detach()
+        else:
+            att_split = att.index_select(2, order_2n).to(self._estimator_att_cache_dtype).detach()
+        cnn_split = cache["conformer_cnn_cache"].index_select(0, order_row).detach()
+        catt_split = cache["conformer_att_cache"].index_select(1, order_row).detach()
+        ecnn_split = cache["estimator_cnn_cache"].index_select(2, order_2n).detach()
         result: list[dict[str, torch.Tensor]] = []
         for row in range(batch_size):
-            estimator_att = cache["estimator_att_cache"]
-            if estimator_att.dtype == self._estimator_att_cache_dtype:
-                request_att = torch.cat(
-                    (
-                        estimator_att[:, :, row : row + 1],
-                        estimator_att[:, :, batch_size + row : batch_size + row + 1],
-                    ),
-                    dim=2,
-                ).detach()
-            else:
-                request_shape = list(estimator_att.shape)
-                request_shape[2] = 2
-                request_att = torch.empty(
-                    request_shape,
-                    device=estimator_att.device,
-                    dtype=self._estimator_att_cache_dtype,
-                )
-                request_att[:, :, 0:1].copy_(estimator_att[:, :, row : row + 1])
-                request_att[:, :, 1:2].copy_(estimator_att[:, :, batch_size + row : batch_size + row + 1])
             result.append(
                 {
-                    "conformer_cnn_cache": cache["conformer_cnn_cache"][row : row + 1].detach().clone(),
-                    "conformer_att_cache": cache["conformer_att_cache"][:, row : row + 1].detach().clone(),
-                    "estimator_cnn_cache": torch.cat(
-                        (
-                            cache["estimator_cnn_cache"][:, :, row : row + 1],
-                            cache["estimator_cnn_cache"][:, :, batch_size + row : batch_size + row + 1],
-                        ),
-                        dim=2,
-                    ).detach(),
-                    "estimator_att_cache": request_att,
+                    "conformer_cnn_cache": cnn_split[row : row + 1],
+                    "conformer_att_cache": catt_split[:, row : row + 1],
+                    "estimator_cnn_cache": ecnn_split[:, :, row * 2 : row * 2 + 2],
+                    "estimator_att_cache": att_split[:, :, row * 2 : row * 2 + 2],
                 }
             )
         if "estimator_att_cache_valid" in cache:
-            valid = cache["estimator_att_cache_valid"]
+            valid = cache["estimator_att_cache_valid"].index_select(0, order_row).detach()
             for row in range(batch_size):
-                result[row]["estimator_att_cache_valid"] = valid[row : row + 1].detach().clone()
+                result[row]["estimator_att_cache_valid"] = valid[row : row + 1]
         return result
 
     def _stack_flow_cache(self, states: list[BatchedToken2WavState]) -> dict[str, torch.Tensor]:
@@ -1249,6 +1291,7 @@ class BatchedToken2Wav(nn.Module):
         batch_size = int(tokens.shape[0])
         flow_cache = self._stack_flow_cache(states)
         speakers = features.speaker_embedding.expand(batch_size, -1)
+        _t_enc = _perf() if _S2BD else 0.0
         with self._autocast(tokens.device):
             hidden, conformer_cnn, conformer_att = self._encode_chunk(
                 tokens,
@@ -1256,6 +1299,10 @@ class BatchedToken2Wav(nn.Module):
                 cnn_cache=flow_cache["conformer_cnn_cache"],
                 att_cache=flow_cache["conformer_att_cache"],
             )
+            if _S2BD:
+                _S2BD_ACC["encoder"][0] += (_perf() - _t_enc) * 1000
+                _S2BD_ACC["encoder"][1] += 1
+                _t_cfm = _perf()
             projected_speakers = self.flow.spk_embed_affine_layer(F.normalize(speakers, dim=1))
             cond = torch.zeros_like(hidden).transpose(1, 2).contiguous()
             chunk_mel, estimator_cnn, estimator_att = self._decode_cfm(
@@ -1268,6 +1315,10 @@ class BatchedToken2Wav(nn.Module):
             )
 
         prompt_len = int(features.mels.shape[1])
+        if _S2BD:
+            _S2BD_ACC["cfm"][0] += (_perf() - _t_cfm) * 1000
+            _S2BD_ACC["cfm"][1] += 1
+            _t_tail = _perf()
         cache_width = self._estimator_cache_width(prompt_len)
         prev_valid = flow_cache.get("estimator_att_cache_valid")
         if (
@@ -1310,6 +1361,10 @@ class BatchedToken2Wav(nn.Module):
         if new_valid_cache is not None:
             new_flow_dict["estimator_att_cache_valid"] = new_valid_cache
         new_flow = self._split_flow_cache(new_flow_dict, batch_size)
+        if _S2BD:
+            _S2BD_ACC["flow_tail"][0] += (_perf() - _t_tail) * 1000
+            _S2BD_ACC["flow_tail"][1] += 1
+            _t_hift = _perf()
         old_mel = torch.cat([state.hift_cache["mel"] for state in states], dim=0)
         old_source = torch.cat([state.hift_cache["source"] for state in states], dim=0)
         old_speech = torch.cat([state.hift_cache["speech"] for state in states], dim=0)
@@ -1332,6 +1387,12 @@ class BatchedToken2Wav(nn.Module):
             for row in range(batch_size)
         ]
         audios = [emitted[row].reshape(-1).to(dtype=torch.float32) for row in range(batch_size)]
+        if _S2BD:
+            _S2BD_ACC["hift_vocoder"][0] += (_perf() - _t_hift) * 1000
+            _S2BD_ACC["hift_vocoder"][1] += 1
+            _S2BD_CALLS[0] += 1
+            if _S2BD_CALLS[0] % 32 == 0:
+                _s2bd_flush()
         return audios, next_states
 
     @staticmethod
@@ -1377,6 +1438,7 @@ class BatchedToken2Wav(nn.Module):
                 )
 
         max_frames = self._max_encode_token_frames(states)
+        _t_bd = _perf() if _S2BD else 0.0
         if any(int(row_tokens.numel()) > max_frames for row_tokens in tokens):
             # decode_batch owns the RelPos-safe encoder slicing used by
             # non-async Talker dumps. Preserve that path for overlong rows;
@@ -1396,7 +1458,13 @@ class BatchedToken2Wav(nn.Module):
                 for group_row, row in enumerate(rows):
                     audios[row] = group_audio[group_row]
                     next_states[row] = group_states[group_row]
+            if _S2BD:
+                _S2BD_ACC["overlong_fallback"][0] += (_perf() - _t_bd) * 1000
+                _S2BD_ACC["overlong_fallback"][1] += 1
             return self._require_complete_ragged_outputs(audios, next_states)
+        if _S2BD:
+            _S2BD_CALLS[0] += 1
+        _t_enc = _perf() if _S2BD else 0.0
         encoder_groups: dict[tuple[int, bool], list[int]] = {}
         for row, (row_tokens, last_chunk) in enumerate(zip(tokens, last_chunks, strict=True)):
             encoder_groups.setdefault((int(row_tokens.numel()), last_chunk), []).append(row)
@@ -1426,6 +1494,9 @@ class BatchedToken2Wav(nn.Module):
                 f'MiniCPMO45Code2WavBatchError {{"reason":"incomplete_encoder_output","rows":{missing_hidden_rows}}}'
             )
         resolved_hidden = cast(list[torch.Tensor], hidden_rows)
+        if _S2BD:
+            _S2BD_ACC["encoder"][0] += (_perf() - _t_enc) * 1000
+            _S2BD_ACC["encoder"][1] += 1
         hidden_lengths = [int(value.shape[1]) for value in resolved_hidden]
         max_hidden_length = max(hidden_lengths)
         padded_hidden = resolved_hidden[0].new_zeros((batch_size, max_hidden_length, int(resolved_hidden[0].shape[2])))
@@ -1433,6 +1504,7 @@ class BatchedToken2Wav(nn.Module):
             padded_hidden[row, : int(hidden.shape[1])].copy_(hidden[0])
 
         flow_cache = self._stack_flow_cache(states)
+        _t_cfm = _perf() if _S2BD else 0.0
         speakers = features.speaker_embedding.expand(batch_size, -1)
         with self._autocast(padded_hidden.device):
             projected_speakers = self.flow.spk_embed_affine_layer(F.normalize(speakers, dim=1))
@@ -1448,6 +1520,10 @@ class BatchedToken2Wav(nn.Module):
             )
 
         prompt_len = int(features.mels.shape[1])
+        if _S2BD:
+            _S2BD_ACC["cfm"][0] += (_perf() - _t_cfm) * 1000
+            _S2BD_ACC["cfm"][1] += 1
+        _t_tail = _perf() if _S2BD else 0.0
         cache_width = self._estimator_cache_width(prompt_len)
         ragged_cache_valid = flow_cache.get("estimator_att_cache_valid")
         assert isinstance(estimator_att, list)
@@ -1504,6 +1580,10 @@ class BatchedToken2Wav(nn.Module):
 
         audios: list[torch.Tensor | None] = [None] * batch_size
         next_states: list[BatchedToken2WavState | None] = [None] * batch_size
+        if _S2BD:
+            _S2BD_ACC["flow_tail"][0] += (_perf() - _t_tail) * 1000
+            _S2BD_ACC["flow_tail"][1] += 1
+        _t_hift = _perf() if _S2BD else 0.0
         vocoder_groups: dict[tuple[int, bool], list[int]] = {}
         for row, last_chunk in enumerate(last_chunks):
             vocoder_groups.setdefault((hidden_lengths[row], last_chunk), []).append(row)
@@ -1535,4 +1615,9 @@ class BatchedToken2Wav(nn.Module):
                     },
                 )
 
+        if _S2BD:
+            _S2BD_ACC["hift_vocoder"][0] += (_perf() - _t_hift) * 1000
+            _S2BD_ACC["hift_vocoder"][1] += 1
+            if _S2BD_CALLS[0] % 32 == 0:
+                _s2bd_flush()
         return self._require_complete_ragged_outputs(audios, next_states)
