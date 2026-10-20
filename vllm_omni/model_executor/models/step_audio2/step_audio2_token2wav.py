@@ -285,6 +285,47 @@ class StepAudio2Token2WavCore(nn.Module):
 
         self._spk_model = get_campplus_torch(f"{self.model_path}/campplus.onnx", device=self.device)
 
+    # e130: per-frame-count NPU graphs for the S3 quantize forward.
+    _MAX_S3_GRAPHS = 2
+
+    @torch.inference_mode()
+    def _quantize_s3_graph(self, mels: torch.Tensor, mels_lens: torch.Tensor):
+        """S3 quantize with an NPU graph; eager fallback off-NPU/failure."""
+        tok = self.audio_tokenizer
+        frames = int(mels.shape[2])
+        graphs = getattr(self, "_s3_graphs", None)
+        if graphs is None:
+            graphs = {}
+            self._s3_graphs = graphs
+        entry = graphs.get(frames)
+        if entry is None:
+            if self.device.type != "npu" or len(graphs) >= self._MAX_S3_GRAPHS or frames > 3000:
+                h, code_len = tok.encoder(mels, mels_lens)
+                return tok.quantizer.encode(h), code_len
+            try:
+                enc = tok.encoder
+                if enc.freqs_cis.device != self.device:
+                    enc.freqs_cis = enc.freqs_cis.to(self.device)
+                for _i in range(2):
+                    h, code_len = enc(mels, mels_lens)
+                    tok.quantizer.encode(h)
+                torch.npu.synchronize()
+                graph = torch.npu.NPUGraph()
+                with torch.npu.graph(graph):
+                    h, code_len = enc(mels, mels_lens)
+                    static_code = tok.quantizer.encode(h)
+                torch.npu.synchronize()
+                entry = (graph, mels, mels_lens, static_code, code_len)
+                graphs[frames] = entry
+            except Exception as _e:
+                h, code_len = tok.encoder(mels, mels_lens)
+                return tok.quantizer.encode(h), code_len
+        graph, static_mels, static_lens, static_code, static_len = entry
+        static_mels.copy_(mels)
+        static_lens.copy_(mels_lens)
+        graph.replay()
+        return static_code.clone(), static_len.clone()
+
     def _prepare_prompt(self, prompt_wav: str):
         """Prepare prompt audio for conditioning"""
         audio_np_raw, sample_rate = load_audio(prompt_wav, sr=None, mono=True)
@@ -295,7 +336,7 @@ class StepAudio2Token2WavCore(nn.Module):
         audio = torch.from_numpy(audio_16k)
         mels = s3tokenizer.log_mel_spectrogram(audio)
         mels, mels_lens = s3tokenizer.padding([mels])
-        prompt_speech_tokens, prompt_speech_tokens_lens = self.audio_tokenizer.quantize(
+        prompt_speech_tokens, prompt_speech_tokens_lens = self._quantize_s3_graph(
             mels.to(self.device), mels_lens.to(self.device)
         )
 

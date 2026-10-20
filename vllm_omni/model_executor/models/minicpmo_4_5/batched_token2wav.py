@@ -293,7 +293,11 @@ def _token2wav_sdpa_context(device: torch.device):
     return npu_token2wav_sdpa_context()
 
 
-def tensor_signature(value: torch.Tensor) -> tuple[tuple[int, ...], str, str]:
+def tensor_signature(value: torch.Tensor | Any) -> tuple[Any, ...]:
+    # 第 111 项: flow_cache may carry host-side bookkeeping ints next to the
+    # device tensors; sign them by value so bucket keys stay stable.
+    if not isinstance(value, torch.Tensor):
+        return ("int", int(value))
     return tuple(value.shape), str(value.dtype), value.device.type
 
 
@@ -1107,6 +1111,13 @@ class BatchedToken2Wav(nn.Module):
             valid = cache["estimator_att_cache_valid"].index_select(0, order_row).detach()
             for row in range(batch_size):
                 result[row]["estimator_att_cache_valid"] = valid[row : row + 1]
+            # Host-side mirror (第 111 项): _stack_flow_cache only carries the
+            # host int when every row agrees, so row order is irrelevant.
+            if "estimator_att_cache_valid_host" in cache:
+                for row in range(batch_size):
+                    result[row]["estimator_att_cache_valid_host"] = cache[
+                        "estimator_att_cache_valid_host"
+                    ]
         return result
 
     def _stack_flow_cache(self, states: list[BatchedToken2WavState]) -> dict[str, torch.Tensor]:
@@ -1125,6 +1136,12 @@ class BatchedToken2Wav(nn.Module):
         valid = [flow.get("estimator_att_cache_valid") for flow in flows]
         if all(item is not None for item in valid):
             stacked["estimator_att_cache_valid"] = torch.cat(valid, dim=0)
+        # Host-side mirror (第 111 项): all-equal on the stacked device tensor
+        # is exactly "every row carries the same host int", checked here so
+        # the consumer never has to sync to evaluate it.
+        valid_host = [flow.get("estimator_att_cache_valid_host") for flow in flows]
+        if all(item is not None for item in valid_host) and len(set(valid_host)) == 1:
+            stacked["estimator_att_cache_valid_host"] = valid_host[0]
         return stacked
 
     def _create_initial_states(
@@ -1183,6 +1200,7 @@ class BatchedToken2Wav(nn.Module):
             flow_cache["estimator_att_cache_valid"] = estimator_att.new_full(
                 (batch_size,), prompt_len, dtype=torch.long
             )
+            flow_cache["estimator_att_cache_valid_host"] = prompt_len
         split = self._split_flow_cache(flow_cache, batch_size)
         mel_channels = int(prompt_mels.shape[2])
         return [
@@ -1248,6 +1266,35 @@ class BatchedToken2Wav(nn.Module):
         batch_size = int(tokens.shape[0])
         if batch_size != len(states):
             raise ValueError(f"tokens batch {batch_size} != state batch {len(states)}")
+        if _os_bd.environ.get("VLLM_OMNI_MEM_TRACE"):
+            self._mem_trace_cnt = getattr(self, "_mem_trace_cnt", 0) + 1
+            if self._mem_trace_cnt % 64 == 0:
+                import logging
+
+                logging.getLogger(__name__).info(
+                    "MEM_TRACE cnt=%d alloc=%.2fG reserved=%.2fG acl_free=%.2fG",
+                    self._mem_trace_cnt,
+                    torch.npu.memory_allocated() / 2**30,
+                    torch.npu.memory_reserved() / 2**30,
+                    torch.npu.mem_get_info()[0] / 2**30,
+                )
+        # 第 112 项: under sustained c8 load the NPU caching allocator's
+        # reserved pool grows round over round (13.9G -> 21.8G observed)
+        # from fragmentation across heterogeneous per-request cache shapes
+        # until acl_free is exhausted and a 1.10G eager cat OOMs the engine.
+        # alloc stays flat, so the pool itself is the problem: release the
+        # unused pool blocks once free device memory runs low. Rate-limited
+        # so the (synchronizing) release happens at most once per minute-ish
+        # of decode and never under healthy headroom.
+        self._mem_guard_cnt = getattr(self, "_mem_guard_cnt", 0) + 1
+        if (
+            # 第 112 项: default ON as of mainline merge (2026-10-20 user
+            # approval); set VLLM_OMNI_MEM_GUARD=0 to opt out explicitly.
+            _os_bd.environ.get("VLLM_OMNI_MEM_GUARD", "1") != "0"
+            and self._mem_guard_cnt % 64 == 0
+            and torch.npu.mem_get_info()[0] < 4 * 2**30
+        ):
+            torch.npu.empty_cache()
         # The encoder's pre-lookahead convolution consumes ``pre_lookahead_len``
         # frames of right context and keeps no left cache, so a non-final chunk
         # must carry at least one full kernel. Only the final chunk is allowed
@@ -1347,10 +1394,16 @@ class BatchedToken2Wav(nn.Module):
             _t_tail = _perf()
         cache_width = self._estimator_cache_width(prompt_len)
         prev_valid = flow_cache.get("estimator_att_cache_valid")
+        # Host-side bookkeeping (第 111 项): the device tensor is written from
+        # a host int via torch.full and _stack_flow_cache only forwards the
+        # mirror when all rows agree, so checking the int replaces the
+        # ``(prev_valid == prev_valid[0]).all()`` and ``int(prev_valid[0])``
+        # device synchronizations without changing the branch.
+        prev_valid_host = flow_cache.get("estimator_att_cache_valid_host")
         if (
             prev_valid is not None
             and int(prev_valid.numel()) == batch_size
-            and bool((prev_valid == prev_valid[0]).all())
+            and prev_valid_host is not None
         ):
             # Aligned path: the input cache is padded to ``cache_width`` and
             # ``prev_valid`` marks its valid prefix. Drop the pad columns,
@@ -1360,7 +1413,7 @@ class BatchedToken2Wav(nn.Module):
                 estimator_att,
                 prompt_len,
                 cache_width,
-                int(prev_valid[0]),
+                prev_valid_host,
                 int(flow_cache["estimator_att_cache"].shape[4]),
             )
             new_valid_cache = torch.full(
@@ -1386,6 +1439,7 @@ class BatchedToken2Wav(nn.Module):
         }
         if new_valid_cache is not None:
             new_flow_dict["estimator_att_cache_valid"] = new_valid_cache
+            new_flow_dict["estimator_att_cache_valid_host"] = new_valid
         new_flow = self._split_flow_cache(new_flow_dict, batch_size)
         if _S2BD:
             _S2BD_ACC["flow_tail"][0] += (_perf() - _t_tail) * 1000
@@ -1552,6 +1606,7 @@ class BatchedToken2Wav(nn.Module):
         _t_tail = _perf() if _S2BD else 0.0
         cache_width = self._estimator_cache_width(prompt_len)
         ragged_cache_valid = flow_cache.get("estimator_att_cache_valid")
+        ragged_cache_valid_host = flow_cache.get("estimator_att_cache_valid_host")
         assert isinstance(estimator_att, list)
         new_flow: list[dict[str, torch.Tensor]] = []
         for row, row_estimator_att in enumerate(estimator_att):
@@ -1567,7 +1622,11 @@ class BatchedToken2Wav(nn.Module):
                     row_estimator_att,
                     prompt_len,
                     cache_width,
-                    int(ragged_cache_valid[row]),
+                    (
+                        ragged_cache_valid_host
+                        if ragged_cache_valid_host is not None
+                        else int(ragged_cache_valid[row])
+                    ),
                     int(flow_cache["estimator_att_cache"].shape[4]),
                 )
             elif row_estimator_att.shape[4] > prompt_len + 100:
@@ -1602,6 +1661,7 @@ class BatchedToken2Wav(nn.Module):
                 row_flow["estimator_att_cache_valid"] = row_estimator_att.new_full(
                     (1,), row_new_valid, dtype=torch.long
                 )
+                row_flow["estimator_att_cache_valid_host"] = row_new_valid
             new_flow.append(row_flow)
 
         audios: list[torch.Tensor | None] = [None] * batch_size
