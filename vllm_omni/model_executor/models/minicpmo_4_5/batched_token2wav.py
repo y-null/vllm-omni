@@ -33,9 +33,7 @@ _S2BD_ACC = {k: [0.0, 0] for k in _S2BD_KEYS}
 
 def _s2bd_flush():
     total = sum(v[0] for v in _S2BD_ACC.values())
-    parts = " ".join(
-        f"{k}={v[0]:.1f}ms(n={v[1]})" for k, v in _S2BD_ACC.items() if v[1] > 0
-    )
+    parts = " ".join(f"{k}={v[0]:.1f}ms(n={v[1]})" for k, v in _S2BD_ACC.items() if v[1] > 0)
     print(f"S2BD calls={_S2BD_CALLS[0]} total={total:.1f}ms {parts}", flush=True)
     for v in _S2BD_ACC.values():
         v[0] = 0.0
@@ -181,9 +179,7 @@ def _align_estimator_cache(
         )
         return estimator_att, cache_width
     # F.pad's tuple starts at the last axis: pad dim4 (kv) right by n.
-    estimator_att = torch.nn.functional.pad(
-        estimator_att, (0, 0, 0, cache_width - total_valid, 0, 0, 0, 0)
-    )
+    estimator_att = torch.nn.functional.pad(estimator_att, (0, 0, 0, cache_width - total_valid, 0, 0, 0, 0))
     return estimator_att, total_valid
 
 
@@ -975,11 +971,7 @@ class BatchedToken2Wav(nn.Module):
                 # From the second step on, the graph-replayed attention output
                 # can be written straight into its streaming cache slot,
                 # skipping the per-step clone+copy pair (see NPUExactGraphRunner).
-                att_sink = (
-                    next_att_cache[step]
-                    if next_att_cache is not None and valid_lengths is None
-                    else None
-                )
+                att_sink = next_att_cache[step] if next_att_cache is not None and valid_lengths is None else None
                 estimate, step_cnn, step_att = self._estimator_step(
                     estimator,
                     x=torch.cat((x, x), dim=0),
@@ -1115,9 +1107,7 @@ class BatchedToken2Wav(nn.Module):
             # host int when every row agrees, so row order is irrelevant.
             if "estimator_att_cache_valid_host" in cache:
                 for row in range(batch_size):
-                    result[row]["estimator_att_cache_valid_host"] = cache[
-                        "estimator_att_cache_valid_host"
-                    ]
+                    result[row]["estimator_att_cache_valid_host"] = cache["estimator_att_cache_valid_host"]
         return result
 
     def _stack_flow_cache(self, states: list[BatchedToken2WavState]) -> dict[str, torch.Tensor]:
@@ -1400,11 +1390,7 @@ class BatchedToken2Wav(nn.Module):
         # ``(prev_valid == prev_valid[0]).all()`` and ``int(prev_valid[0])``
         # device synchronizations without changing the branch.
         prev_valid_host = flow_cache.get("estimator_att_cache_valid_host")
-        if (
-            prev_valid is not None
-            and int(prev_valid.numel()) == batch_size
-            and prev_valid_host is not None
-        ):
+        if prev_valid is not None and int(prev_valid.numel()) == batch_size and prev_valid_host is not None:
             # Aligned path: the input cache is padded to ``cache_width`` and
             # ``prev_valid`` marks its valid prefix. Drop the pad columns,
             # trim to [prompt prefix | tail ``keep`` valid frames] and pad
@@ -1416,9 +1402,7 @@ class BatchedToken2Wav(nn.Module):
                 prev_valid_host,
                 int(flow_cache["estimator_att_cache"].shape[4]),
             )
-            new_valid_cache = torch.full(
-                (batch_size,), new_valid, dtype=torch.long, device=estimator_att.device
-            )
+            new_valid_cache = torch.full((batch_size,), new_valid, dtype=torch.long, device=estimator_att.device)
         else:
             if estimator_att.shape[4] > prompt_len + 100:
                 estimator_att = torch.cat(
@@ -1622,11 +1606,7 @@ class BatchedToken2Wav(nn.Module):
                     row_estimator_att,
                     prompt_len,
                     cache_width,
-                    (
-                        ragged_cache_valid_host
-                        if ragged_cache_valid_host is not None
-                        else int(ragged_cache_valid[row])
-                    ),
+                    (ragged_cache_valid_host if ragged_cache_valid_host is not None else int(ragged_cache_valid[row])),
                     int(flow_cache["estimator_att_cache"].shape[4]),
                 )
             elif row_estimator_att.shape[4] > prompt_len + 100:
