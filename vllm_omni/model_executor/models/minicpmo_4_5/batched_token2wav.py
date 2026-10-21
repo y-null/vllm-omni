@@ -47,6 +47,12 @@ _S2BD_CALLS = [0]
 _HIFT_COMPILE = _os_bd.environ.get("VLLM_OMNI_HIFT_COMPILE") == "1"
 # 第 101 项：hift NPU 平台图回放（_inference_pre_istft 体）实验开关。
 _HIFT_NPU_GRAPH = _os_bd.environ.get("VLLM_OMNI_HIFT_NPU_GRAPH", "1") == "1"  # 实验臂默认开
+# 第 141 项：ragged CFM NPU 图回放实验开关。NPU 上 CFM 此前全 eager
+# （_cfm_graph_wrapper 为 CUDA-only，py-spy e143: estimator_step 45.4% 样本
+# 全部 Python 发射/准备，0% 图回放），c8 流式 decode_ragged_batch 恒走
+# ragged 展开且其输入本身是 padded 统一形状、valid_lengths 仅以设备张量
+# 参与计算（_gather_causal_cache）→ 整段可按形状签名捕获回放。
+_RAGGED_CFM_NPU_GRAPH = _os_bd.environ.get("VLLM_OMNI_RAGGED_CFM_NPU_GRAPH", "1") == "1"  # 实验臂默认开
 
 _SILENCE_TOKEN = 4218
 # CosyVoice2 RelPos PE is built for max_len=5000 and `forward_chunk` never
@@ -419,6 +425,26 @@ class BatchedToken2Wav(nn.Module):
                     )
             except Exception as exc:  # pragma: no cover - 平台差异兜底
                 logger.warning("HiFT NPU graph runner unavailable: %s", exc)
+        # 第 141 项：ragged CFM 图 runner（NPU 上 CFM 此前全 eager）。
+        self._ragged_cfm_runner = None
+        if _RAGGED_CFM_NPU_GRAPH:
+            try:
+                from vllm_omni.platforms.npu.graph_tools import NPUExactGraphRunner
+
+                flow_parameter = next(self.flow.parameters(), None)
+                if (
+                    flow_parameter is not None
+                    and flow_parameter.device.type == "npu"
+                    and NPUExactGraphRunner.is_supported()
+                ):
+                    self._ragged_cfm_runner = NPUExactGraphRunner(
+                        max_graphs=16,
+                        component_name="ragged_cfm",
+                        disable_config_hint="unset VLLM_OMNI_RAGGED_CFM_NPU_GRAPH",
+                    )
+                    logger.info("Ragged CFM NPUGraph enabled (max_graphs=16)")
+            except Exception as exc:  # pragma: no cover - 平台差异兜底
+                logger.warning("Ragged CFM NPU graph runner unavailable: %s", exc)
         graph_config = dict(hift_graph_config or {})
         if bool(graph_config.get("enabled", False)):
             if hift_parameter is None:
@@ -720,6 +746,18 @@ class BatchedToken2Wav(nn.Module):
         if valid_lengths is not None:
             if not hasattr(estimator, "in_proj"):
                 raise RuntimeError('MiniCPMO45Code2WavBatchError {"reason":"ragged_kernel_unavailable"}')
+            if self._ragged_cfm_runner is not None and attn_mask is not None:
+                return self._ragged_cfm_graph_step(
+                    estimator,
+                    estimator_input,
+                    time_embedding,
+                    attn_mask,
+                    cnn_cache,
+                    att_cache,
+                    cnn_out,
+                    att_out,
+                    valid_lengths,
+                )
             result = self._blocks_forward_chunk_ragged(
                 estimator,
                 estimator_input,
@@ -755,6 +793,104 @@ class BatchedToken2Wav(nn.Module):
             indices[:, None, :].expand(-1, int(history.shape[1]), -1),
         )
 
+    _LENGTHS_CACHE: dict[Any, torch.Tensor] = {}
+    _LENGTHS_CACHE_MAX = 512
+
+    def _lengths_tensor(
+        self, valid_lengths: list[int], device: torch.device
+    ) -> torch.Tensor:
+        # 第 140 项：两处每步 torch.tensor(host, device=npu) 是 pageable H2D，
+        # 每次抽干队列（与第 116 项 setup 路径同机理）。valid_lengths 在同一
+        # chunk 的 10 个 Euler 步内恒定、跨 chunk 由桶化收敛——按值缓存设备
+        # 张量，miss 时逐字节等价重建。下游只读（掩码比较），缓存安全。
+        # A/B（e146 vs e147，同窗口 c8×2）：run1 对 run1 -0.8%（噪声内），
+        # run2 对照被 load 尖峰污染；上界 ~2% < 单次波动 ±10% → 低于分辨力，
+        # 归档待打包，不单独采纳。
+        key = (tuple(valid_lengths), device)
+        tensor = self._LENGTHS_CACHE.get(key)
+        if tensor is None:
+            if len(self._LENGTHS_CACHE) >= self._LENGTHS_CACHE_MAX:
+                self._LENGTHS_CACHE.clear()
+            tensor = torch.tensor(
+                (*valid_lengths, *valid_lengths), device=device, dtype=torch.long
+            )
+            self._LENGTHS_CACHE[key] = tensor
+        return tensor
+
+    def _ragged_cfm_graph_step(
+        self,
+        estimator: nn.Module,
+        estimator_input: torch.Tensor,
+        time_embedding: torch.Tensor,
+        attn_mask: torch.Tensor,
+        cnn_cache: torch.Tensor | None,
+        att_cache: torch.Tensor | None,
+        cnn_out: torch.Tensor,
+        att_out: torch.Tensor,
+        valid_lengths: list[int],
+    ) -> torch.Tensor:
+        """第 141 项：ragged CFM 经 NPUExactGraphRunner 按形状签名捕获回放。
+
+        物化规则与 eager None 分支逐位等价：
+        - cnn_cache None -> zeros_like(cnn_out)（= :820 动态建 zeros 的产物）
+        - att_cache None -> 零宽整块（forward_chunk 对 None/零宽等价，
+          与 CUDA 侧 CFMGraphWrapper 物化先例一致）。
+        """
+        graph_cnn = cnn_cache if cnn_cache is not None else torch.zeros_like(cnn_out)
+        graph_att = (
+            att_cache
+            if att_cache is not None
+            else estimator_input.new_zeros(att_out.shape[:3] + (0,) + att_out.shape[4:])
+        )
+        # 与 eager 路径 :702 的 dtype 归一同款（否则图内 dtype 签名漂移）。
+        if graph_att.dtype != estimator_input.dtype:
+            graph_att = graph_att.to(dtype=estimator_input.dtype)
+        lengths = self._lengths_tensor(valid_lengths, estimator_input.device)
+        outputs = self._ragged_cfm_runner.run(
+            "ragged_cfm",
+            (
+                estimator_input,
+                time_embedding,
+                attn_mask,
+                graph_cnn,
+                graph_att,
+                cnn_out,
+                att_out,
+                lengths,
+            ),
+            (),
+            self._ragged_cfm_compute,
+            output_into=(None, cnn_out, att_out),
+        )
+        # 与 eager ragged 分支同构：返回 (result, cnn_out, att_out) 三元组
+        # （调用方 _decode_cfm 按 3 值 unpack；buffer 已由 output_into 回写）。
+        return outputs[0], cnn_out, att_out
+
+    def _ragged_cfm_compute(
+        self,
+        estimator_input: torch.Tensor,
+        time_embedding: torch.Tensor,
+        attn_mask: torch.Tensor,
+        graph_cnn: torch.Tensor,
+        graph_att: torch.Tensor,
+        cnn_out: torch.Tensor,
+        att_out: torch.Tensor,
+        lengths: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        estimator = self.flow.decoder.estimator
+        result = self._blocks_forward_chunk_ragged(
+            estimator,
+            estimator_input,
+            time_embedding,
+            attn_mask,
+            graph_cnn,
+            graph_att,
+            cnn_out,
+            att_out,
+            lengths,
+        )
+        return (result, cnn_out, att_out)
+
     def _blocks_forward_chunk_ragged(
         self,
         estimator: nn.Module,
@@ -765,14 +901,15 @@ class BatchedToken2Wav(nn.Module):
         att_cache: Any,
         cnn_cache_buffer: torch.Tensor,
         att_cache_buffer: torch.Tensor,
-        valid_lengths: list[int],
+        valid_lengths: list[int] | torch.Tensor,
     ) -> torch.Tensor:
         """Run one padded DiT batch while capturing exact per-row CNN state."""
-        lengths = torch.tensor(
-            (*valid_lengths, *valid_lengths),
-            device=estimator_input.device,
-            dtype=torch.long,
-        )
+        # 第 141 项：图化路径直接传设备 lengths 张量（图内 gather 依赖），
+        # eager 路径仍传 host 列表（走按值缓存，第 140 项）。
+        if isinstance(valid_lengths, torch.Tensor):
+            lengths = valid_lengths
+        else:
+            lengths = self._lengths_tensor(valid_lengths, estimator_input.device)
         x = estimator.in_proj(estimator_input.transpose(1, 2))
         for block_index, block in enumerate(estimator.blocks):
             (
@@ -917,10 +1054,7 @@ class BatchedToken2Wav(nn.Module):
         if valid_lengths is not None:
             if len(valid_lengths) != batch_size:
                 raise ValueError(f"valid length count {len(valid_lengths)} != batch {batch_size}")
-            cfg_lengths = torch.tensor(
-                (*valid_lengths, *valid_lengths),
-                device=mu.device,
-            )
+            cfg_lengths = self._lengths_tensor(valid_lengths, mu.device)
             positions = torch.arange(int(mu.shape[2]), device=mu.device)
             valid_queries = positions.unsqueeze(0) < cfg_lengths.unsqueeze(1)
             current_keys = valid_queries.unsqueeze(1).expand(-1, int(mu.shape[2]), -1)
