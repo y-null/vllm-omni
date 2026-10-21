@@ -437,12 +437,18 @@ class BatchedToken2Wav(nn.Module):
                     and flow_parameter.device.type == "npu"
                     and NPUExactGraphRunner.is_supported()
                 ):
+                    # 第 152 项：池上限 16->8。e152 四轮 c8 复验实测 12
+                    # 张图 buffer 常驻（每张含 estimator_input/mask/cache
+                    # 大张量，合计 ~4-6GiB）把 stage2 可用 HBM 压到临界，
+                    # 多轮碎片化后 eager cat 1.10GiB OOM 崩 stage2。减半
+                    # 常驻上限保可用性；miss 形状走 eager（本就是 OOM 时
+                    # 的回退路径，RTF 代价远小于崩）。
                     self._ragged_cfm_runner = NPUExactGraphRunner(
-                        max_graphs=16,
+                        max_graphs=8,
                         component_name="ragged_cfm",
                         disable_config_hint="unset VLLM_OMNI_RAGGED_CFM_NPU_GRAPH",
                     )
-                    logger.info("Ragged CFM NPUGraph enabled (max_graphs=16)")
+                    logger.info("Ragged CFM NPUGraph enabled (max_graphs=8)")
             except Exception as exc:  # pragma: no cover - 平台差异兜底
                 logger.warning("Ragged CFM NPU graph runner unavailable: %s", exc)
         graph_config = dict(hift_graph_config or {})
@@ -1414,6 +1420,11 @@ class BatchedToken2Wav(nn.Module):
         if (
             # 第 112 项: default ON as of mainline merge (2026-10-20 user
             # approval); set VLLM_OMNI_MEM_GUARD=0 to opt out explicitly.
+            # 第 151 项: 护栏参数放松（%128+3GB）已被 OOM 实证否决——e151c
+            # 现场 free 403MiB 时 torch.cat 562MiB 直接崩 stage2（empty_cache
+            # 可清空间 reserved-allocated 仅 0.68GiB，事后清理无能为力）。
+            # OOM 防线改由第 152 项"捕获准入门控"前移承担，护栏参数恢复
+            # 112 项采纳原值（%64+4GB）。
             _os_bd.environ.get("VLLM_OMNI_MEM_GUARD", "1") != "0"
             and self._mem_guard_cnt % 64 == 0
             and torch.npu.mem_get_info()[0] < 4 * 2**30

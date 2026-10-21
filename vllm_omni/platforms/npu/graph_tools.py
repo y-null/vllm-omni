@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+import os
 from typing import Protocol
 
 import torch
@@ -73,6 +74,11 @@ class NPUExactGraphRunner:
         self._failed_keys: set[tuple[object, ...]] = set()
         self._hits = 0
         self._graph_pool: object | None = None
+        # 第 152 项：捕获准入 HBM 水位地板（字节）。默认 3GiB；0 = 关闭门控。
+        _admission_gb = float(
+            os.environ.get("VLLM_OMNI_GRAPH_CAPTURE_FREE_HBM_GB", "3")
+        )
+        self._capture_free_hbm_bytes = max(0.0, _admission_gb) * 2**30
 
     @staticmethod
     def is_supported() -> bool:
@@ -179,6 +185,30 @@ class NPUExactGraphRunner:
                 self.max_graphs,
             )
             return eager_outputs
+        # 第 152 项：捕获准入门控。HBM 空闲低于阈值时放弃捕获新图（本批走
+        # eager），把 OOM 防线从"事后 empty_cache 清理"（第 112 项护栏，e151
+        # 实验证明其参数放松即崩）前移为"事前准入"。e151 现场：捕获期与
+        # 长音频 offset 组合下 ragged 图持续捕获（10 次/68s）+ 每图 static
+        # buffer 常驻，free 掉到 403MiB 后 torch.cat 562MiB 直接 OOM。水位
+        # 恢复后同形状自然重试捕获，零状态机。e152 四轮 c8 复验：门控触发
+        # 40 次后仍于 free 830MiB 崩（12 张图 buffer 已常驻 + 多轮碎片化，
+        # eager cat 1.10GiB 失败）——准入地板升到 3GiB，配合池上限 16->8
+        # 把常驻图 buffer 减半。VLLM_OMNI_GRAPH_CAPTURE_FREE_HBM_GB=0 关闭
+        # 门控（旧行为）。
+        if self._capture_free_hbm_bytes > 0:
+            try:
+                free_bytes = torch.npu.mem_get_info()[0]
+            except Exception:  # pragma: no cover - 非 NPU 环境兜底
+                free_bytes = 1 << 62
+            if free_bytes < self._capture_free_hbm_bytes:
+                logger.warning_once(
+                    "%s skipped NPUGraph capture: free HBM %.2f GiB < %.2f GiB "
+                    "admission floor (eager fallback, retried when memory frees).",
+                    self.component_name,
+                    free_bytes / 2**30,
+                    self._capture_free_hbm_bytes / 2**30,
+                )
+                return eager_outputs
         try:
             self._graphs[key] = self.capture(inputs, compute)
         except Exception as exc:
