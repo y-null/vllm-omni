@@ -61,6 +61,11 @@ connectors:
       # MINICPMO_TOKEN2WAV_TRT and token2wav_device_spk: false win when both
       # are set.
       token2wav_spk_cpu_reference: true
+      # Run the graph precapture sweep right after the weights load instead of
+      # on the first forward: Stage 2 never issues a warmup forward, so the
+      # deferred sweep used to stall the first real requests (a C8 duplex
+      # replay lost its first-wave sessions to the ~1-2 s per graph capture).
+      cfm_graph_precapture_after_load: true
 
 stages:
   - stage_id: 0
