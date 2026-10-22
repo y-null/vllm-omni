@@ -22,8 +22,8 @@ logger = init_logger(__name__)
 # 第 98 项诊断探针（P55/P94 同族，env 门控零开销）：stage2 ragged decode 的
 # 宿主侧分段账单。VLLM_OMNI_S2_BREAKDOWN=1 时启用，每 32 次 decode 打印一次
 # 聚合（单位 ms）。grep 关键字 S2BD。
-import os as _os_bd
-import time as _time_bd
+import os as _os_bd  # noqa: E402
+import time as _time_bd  # noqa: E402
 
 _perf = _time_bd.perf_counter
 _S2BD = _os_bd.environ.get("VLLM_OMNI_S2_BREAKDOWN") == "1"
@@ -187,6 +187,14 @@ def _align_estimator_cache(
     # F.pad's tuple starts at the last axis: pad dim4 (kv) right by n.
     estimator_att = torch.nn.functional.pad(estimator_att, (0, 0, 0, cache_width - total_valid, 0, 0, 0, 0))
     return estimator_att, total_valid
+
+
+def _free_hbm_bytes() -> int:
+    """Free NPU HBM bytes, or -1 when NPU bookkeeping is unavailable (CPU)."""
+    try:
+        return int(torch.npu.mem_get_info()[0])
+    except Exception:
+        return -1
 
 
 def _zero_padded_frames(tensor: torch.Tensor, valid_frames: int | None) -> None:
@@ -802,9 +810,7 @@ class BatchedToken2Wav(nn.Module):
     _LENGTHS_CACHE: dict[Any, torch.Tensor] = {}
     _LENGTHS_CACHE_MAX = 512
 
-    def _lengths_tensor(
-        self, valid_lengths: list[int], device: torch.device
-    ) -> torch.Tensor:
+    def _lengths_tensor(self, valid_lengths: list[int], device: torch.device) -> torch.Tensor:
         # 第 140 项：两处每步 torch.tensor(host, device=npu) 是 pageable H2D，
         # 每次抽干队列（与第 116 项 setup 路径同机理）。valid_lengths 在同一
         # chunk 的 10 个 Euler 步内恒定、跨 chunk 由桶化收敛——按值缓存设备
@@ -817,9 +823,7 @@ class BatchedToken2Wav(nn.Module):
         if tensor is None:
             if len(self._LENGTHS_CACHE) >= self._LENGTHS_CACHE_MAX:
                 self._LENGTHS_CACHE.clear()
-            tensor = torch.tensor(
-                (*valid_lengths, *valid_lengths), device=device, dtype=torch.long
-            )
+            tensor = torch.tensor((*valid_lengths, *valid_lengths), device=device, dtype=torch.long)
             self._LENGTHS_CACHE[key] = tensor
         return tensor
 
@@ -1384,6 +1388,50 @@ class BatchedToken2Wav(nn.Module):
             )
         return result
 
+    def _low_water_split_point(self, batch_size: int) -> int | None:
+        """第 153 项: halve the batch when free HBM is under the low-water mark.
+
+        The e152d crash chain (562MiB cat inside ``_align_estimator_cache``
+        with 474MiB free, 2026-10-21) happens because the tensors alive
+        during one decode scale with the batch: stacked caches, padded
+        inputs, and per-step activations all hold ``batch`` rows at once.
+        ``empty_cache`` cannot help once ``reserved ~= allocated`` (the
+        第 112 项 guard already drains the pool); the only remaining lever
+        is shrinking the resident peak by processing the batch in halves.
+        Halves recurse down to single rows, where the resident set is
+        smallest. The split only fires under memory pressure, so the
+        healthy path is untouched. Returns the split point, or None when
+        no split is needed.
+        """
+        if batch_size < 2:
+            return None
+        if _os_bd.environ.get("VLLM_OMNI_C2W_OOM_SPLIT", "1") == "0":
+            return None
+        try:
+            threshold_gb = float(_os_bd.environ.get("VLLM_OMNI_C2W_LOW_WATER_GB", "1"))
+        except ValueError:
+            threshold_gb = 1.0
+        if threshold_gb <= 0:
+            return None
+        free = _free_hbm_bytes()
+        if free < 0 or free >= threshold_gb * 2**30:
+            return None
+        torch.npu.empty_cache()
+        free = _free_hbm_bytes()
+        if free < 0 or free >= threshold_gb * 2**30:
+            return None
+        self._oom_split_cnt = getattr(self, "_oom_split_cnt", 0) + 1
+        logger.info(
+            "Code2Wav OOM-split #%d: free=%.0fMiB < %.2fGiB after empty_cache; halving batch %d -> [%d, %d]",
+            self._oom_split_cnt,
+            free / 2**20,
+            threshold_gb,
+            batch_size,
+            batch_size // 2,
+            batch_size - batch_size // 2,
+        )
+        return batch_size // 2
+
     def decode_batch(
         self,
         tokens: torch.Tensor,
@@ -1396,6 +1444,23 @@ class BatchedToken2Wav(nn.Module):
         batch_size = int(tokens.shape[0])
         if batch_size != len(states):
             raise ValueError(f"tokens batch {batch_size} != state batch {len(states)}")
+        mid = self._low_water_split_point(batch_size)
+        if mid is not None:
+            head = self.decode_batch(
+                tokens[:mid],
+                features,
+                states[:mid],
+                last_chunk=last_chunk,
+                flush_encoder=flush_encoder,
+            )
+            tail = self.decode_batch(
+                tokens[mid:],
+                features,
+                states[mid:],
+                last_chunk=last_chunk,
+                flush_encoder=flush_encoder,
+            )
+            return head[0] + tail[0], head[1] + tail[1]
         if _os_bd.environ.get("VLLM_OMNI_MEM_TRACE"):
             self._mem_trace_cnt = getattr(self, "_mem_trace_cnt", 0) + 1
             if self._mem_trace_cnt % 64 == 0:
@@ -1646,6 +1711,21 @@ class BatchedToken2Wav(nn.Module):
                     f'"frames":{num_frames},"minimum":{lookahead + 1}}}'
                 )
 
+        mid = self._low_water_split_point(batch_size)
+        if mid is not None:
+            head = self.decode_ragged_batch(
+                tokens[:mid],
+                features,
+                states[:mid],
+                last_chunks=last_chunks[:mid],
+            )
+            tail = self.decode_ragged_batch(
+                tokens[mid:],
+                features,
+                states[mid:],
+                last_chunks=last_chunks[mid:],
+            )
+            return head[0] + tail[0], head[1] + tail[1]
         max_frames = self._max_encode_token_frames(states)
         _t_bd = _perf() if _S2BD else 0.0
         if any(int(row_tokens.numel()) > max_frames for row_tokens in tokens):
