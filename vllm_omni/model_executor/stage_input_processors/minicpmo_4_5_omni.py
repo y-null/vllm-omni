@@ -3,6 +3,7 @@
 """MiniCPM-o 4.5 Thinker-to-Talker and Talker-to-Code2Wav bridges."""
 
 import logging
+import os
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -28,6 +29,18 @@ _MINICPMO45_ASYNC_STATE = "_minicpmo45_async_codec_state"
 _MINICPMO45_STREAM_RECORD = "_minicpmo45_async_stream_record"
 _MINICPMO45_SILENCE_CODE = 4218
 _MINICPMO45_MIN_STREAM_BODY_FRAMES = 5
+
+
+def _whole_utterance_tts_enabled() -> bool:
+    """Whole-utterance TTS experiment (``VLLM_OMNI_T2A_WHOLE_UTTERANCE=1``).
+
+    Hold the Talker's codec stream until the request's terminal step, then
+    publish one seamless payload per request instead of fixed-size chunks
+    (single decode, zero seams — the pre-async serving shape). Applies to
+    non-duplex (turn-based TTS) requests only; duplex sessions keep their
+    streaming contract. Default off: behavior is bit-identical.
+    """
+    return os.environ.get("VLLM_OMNI_T2A_WHOLE_UTTERANCE", "") == "1"
 
 
 class _MiniCPMO45MetaStruct(MetaStruct):
@@ -412,6 +425,10 @@ def tts2code2wav_async_chunk(
     # the steady window itself at 25 frames it only added a seam.
     flush_pending = finished
     last_chunk = bool(flush_pending and (not native_duplex or turn_end))
+    if _whole_utterance_tts_enabled() and not native_duplex and not flush_pending:
+        # Whole-utterance mode: hold the stream untouched; the terminal step
+        # below emits every accumulated frame as one seamless payload.
+        return None
     if not flush_pending and len(pending) < chunk_frames:
         return None
 
