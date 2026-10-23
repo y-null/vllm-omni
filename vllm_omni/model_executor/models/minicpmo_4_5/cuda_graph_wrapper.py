@@ -6,7 +6,7 @@ import itertools
 import time
 import weakref
 from collections import Counter
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from contextlib import nullcontext
 from typing import NamedTuple
 
@@ -147,6 +147,15 @@ class HiFTGraphWrapper:
         self.mel_frames = int(token2wav.hift.conv_pre.in_channels)
         self.flow_upsample_rate = int(getattr(token2wav.flow, "token_mel_ratio", 2))
         self.extra_codec_chunk_frames = [int(c) for c in connector_config.get("hift_graph_codec_chunk_frames") or ()]
+        # Mel-frame grid for drifted streaming widths (see _bucket_mel_frames).
+        # 0 disables grid bucketing; the exact-bucket shapes above always win.
+        self.frame_bucket = int(connector_config.get("hift_frame_bucket", 2))
+        # Grid widths precaptured past the configured continuation range to
+        # absorb streaming pacing drift (see derive_capture_bucket_size).
+        self.frame_bucket_precapture_extra = int(connector_config.get("hift_frame_bucket_precapture_extra", 6))
+        istft_params = getattr(token2wav.hift, "istft_params", None)
+        self.istft_n_fft = int(istft_params["n_fft"]) if istft_params else 0
+        self.istft_hop_len = int(istft_params["hop_len"]) if istft_params else 0
         self.capture_bucket_size, self.capture_source_cache_len = self.derive_capture_bucket_size()
         # The only (mel_frames, cache_source_len) shapes ever lazily captured: a duplex first chunk's
         # arbitrary width is seen once, and capturing it would stall every stream for one replay.
@@ -158,6 +167,7 @@ class HiFTGraphWrapper:
             codec_frame_range(connector_config.get(name), name=name)
             for name in ("hift_graph_first_chunk_frames", "hift_graph_continuation_frames")
         )
+        self._append_drift_grid_shapes()
         self.exact_batch_sizes = sorted(
             {int(b) for b in connector_config.get("hift_graph_exact_batch_sizes") or (1,) if int(b) > 0}
         )
@@ -201,12 +211,60 @@ class HiFTGraphWrapper:
         shapes = list(dict.fromkeys(shapes))
         return [shape[0] for shape in shapes], [shape[1] for shape in shapes]
 
+    def _append_drift_grid_shapes(self) -> None:
+        """Precapture the grid widths past the configured continuation range.
+
+        Streaming pacing drifts a few frames past the configured codec chunk
+        (29-34 vs the configured range in one 128/8 bench), and a lazy capture
+        stalls the NPU for seconds mid-request. Extending the precapture list
+        lets drifted widths replay through ``_legit_shapes`` directly; unseen
+        widths beyond the extra range still fall back to the lazy path.
+        """
+        if self.frame_bucket <= 1 or self.frame_bucket_precapture_extra <= 0:
+            return
+        top_mel = self._chunk_mel_frames(max(self.continuation_frames)) + self.mel_cache_len
+        for i in range(1, self.frame_bucket_precapture_extra + 1):
+            width = top_mel + i * self.frame_bucket
+            if width <= 2 * top_mel and width not in self.capture_bucket_size:
+                self.capture_bucket_size.append(width)
+                self.capture_source_cache_len.append(self.source_cache_len)
+                self._legit_shapes.add((width, self.source_cache_len))
+
     def derive_exact_shapes(self) -> list[tuple[int, int]]:
         """``(mel_frames, cache_source_len)`` of the exact-shape graphs, outside the buckets."""
         shapes = [(self._chunk_mel_frames(f), 0) for f in self.first_chunk_frames] + [
             (self._chunk_mel_frames(f) + self.mel_cache_len, self.source_cache_len) for f in self.continuation_frames
         ]
         return list(dict.fromkeys(s for s in shapes if s[0] > 0 and s not in self._legit_shapes))
+
+    def _wave_len(self, mel_frames: int) -> int:
+        """Waveform samples HiFT emits for ``mel_frames`` (torch.istft output length)."""
+        return self.istft_n_fft + self.istft_hop_len * (mel_frames - 1)
+
+    def _bucket_mel_frames(self, num_frames: int, cache_source_len: int) -> int | None:
+        """Graph mel width for a drifted streaming width, or ``None`` to stay eager.
+
+        The duplex loop delivers a few frames more or less per step than the
+        configured codec chunk implies, so the exact-bucket shapes miss and
+        every continuation chunk falls back to eager HiFT (96/96 eager calls in
+        one 128/8 bench). Aligning up to ``hift_frame_bucket`` makes drifted
+        widths share one graph; the outputs are trimmed back at the replay
+        return. Only the two cache widths the streaming loop produces are
+        bucketed (the cached continuation width and the cacheless chunk);
+        anything else, or a width beyond twice the largest configured bucket,
+        keeps the eager path untouched.
+        """
+        if (
+            self.frame_bucket <= 1
+            or self.istft_n_fft <= 0
+            or self.istft_hop_len <= 0
+            or cache_source_len not in (0, self.source_cache_len)
+        ):
+            return None
+        bucketed = _align_up(num_frames, self.frame_bucket)
+        if bucketed <= self.mel_cache_len or bucketed > 2 * max(self.capture_bucket_size):
+            return None
+        return bucketed
 
     def capture(self):
         for batch_size in self.capture_batch_sizes:
@@ -310,10 +368,16 @@ class HiFTGraphWrapper:
             # An exact-shape graph: same shape as the eager call, no padding.
             return self._replay_key(exact_key, speech_feat, cache_source)
 
+        pad_frames = 0
         if (num_frames, cache_source_len) not in self._legit_shapes:
-            # Never lazily captured (see ``_legit_shapes``): one eager call over the whole batch.
-            logger.info("Eager HiFT for shape %s outside the capture buckets", exact_key)
-            return self.decode_fn(speech_feat, cache_source)
+            bucketed = self._bucket_mel_frames(num_frames, cache_source_len)
+            if bucketed is None:
+                # Never lazily captured (see ``_legit_shapes``): one eager call over the whole batch.
+                logger.info("Eager HiFT for shape %s outside the capture buckets", exact_key)
+                return self.decode_fn(speech_feat, cache_source)
+            # A drifted streaming width: capture/replay on the grid-aligned
+            # graph, then trim the outputs back to ``num_frames`` below.
+            pad_frames = bucketed - num_frames
 
         target_b = next((b for b in sorted(self.capture_batch_sizes) if b >= batch_size), None)
 
@@ -329,7 +393,7 @@ class HiFTGraphWrapper:
             logger.info("Falling back to eager HiFT inference for unsupported batch size %d", batch_size)
             return self.decode_fn(speech_feat, cache_source)
 
-        key = (target_b, num_frames, cache_source_len)
+        key = (target_b, num_frames + pad_frames, cache_source_len)
 
         if key not in self.graph:
             if self.lazy_graph_count >= self.max_lazy_graphs:
@@ -339,7 +403,19 @@ class HiFTGraphWrapper:
             self._capture(*key)
             self.lazy_graph_count += 1
 
-        return self._replay_key(key, speech_feat, cache_source)
+        if pad_frames:
+            speech_feat = torch.nn.functional.pad(speech_feat, (0, pad_frames))
+        speech, source = self._replay_key(key, speech_feat, cache_source)
+        if pad_frames:
+            # Trim the padded tail back to the caller's width: speech to
+            # torch.istft's output length for the real frames, source to its
+            # exact per-frame upscale (f0_upsamp is a linear Upsample). The
+            # call sites slice ``source[..., -source_cache_len:]`` for the next
+            # chunk and emit ``speech[..., :-source_cache_len]``; both then land
+            # on the same samples as the unpadded shape.
+            speech = speech[..., : self._wave_len(num_frames)].contiguous()
+            source = source[..., : num_frames * (source.shape[2] // (num_frames + pad_frames))].contiguous()
+        return speech, source
 
     def _replay_key(self, key, speech_feat, cache_source):
         """Replay the captured graph ``key`` on a batch of at most ``key[0]`` rows."""
@@ -1885,6 +1961,8 @@ class WholeEulerCFMGraphWrapper:
         max_graph_bytes: int = 1 << 30,
         keep: tuple[int, int] | None = None,
         tail_frames: int = 0,
+        query_widths: Sequence[int] | None = None,
+        batches: Sequence[int] | None = None,
     ) -> int:
         """Capture Whole-Euler graphs for one prompt before serving. Returns the capture count."""
         if not self.enabled:
@@ -1893,18 +1971,17 @@ class WholeEulerCFMGraphWrapper:
             return self._precapture_slots(channels=int(channels), spk_dim=int(spk_dim))
         self._att_capacity = max(self._att_capacity, int(steady))
         grid = sorted({_capture_offset(int(o), self.offset_bucket_frames, int(steady)) for o in offsets}, reverse=True)
-        widths = self.query_widths
+        widths = self.query_widths if query_widths is None else tuple(dict.fromkeys(int(w) for w in query_widths))
         if not widths:
             return 0
-        keys = [(b, w, o) for b in sorted(self._graph_batches(), reverse=True) for w in widths for o in grid]
+        batch_sizes = sorted(self._graph_batches() if batches is None else {int(b) for b in batches}, reverse=True)
+        keys = [(b, w, o) for b in batch_sizes for w in widths for o in grid]
         # Final chunks include lookahead (50 + 6 -> 100). Warm their
         # existing replay buckets before serving, after the steady graphs
         # so a tight cache budget still prioritizes the common shapes.
         if tail_frames > 0:
             tail_widths = sorted({_capture_query_width(w + tail_frames, widths) for w in widths} - set(widths))
-            keys.extend(
-                (b, w, o) for b in sorted(self._graph_batches(), reverse=True) for w in tail_widths for o in grid
-            )
+            keys.extend((b, w, o) for b in batch_sizes for w in tail_widths for o in grid)
         room = self.max_graphs - (len(self._cache) + len(self._slot_graphs))
         if len(keys) > room:
             logger.warning(

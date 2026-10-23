@@ -753,3 +753,41 @@ def test_full_payload_accumulates_codec_validity_per_frame(last_valid):
     full, _ = transport._materialize_full_payload_entry(transport._pending_full_payload_send["req"])
     payload = tts2code2wav_full_payload(_manager(), full, request)
     assert _codes(payload) == [4218, 4218, 4218, 10, 11] + ([12] if last_valid else [])
+
+
+def test_whole_utterance_mode_holds_stream_until_terminal(monkeypatch) -> None:
+    """VLLM_OMNI_T2A_WHOLE_UTTERANCE=1: publish one seamless terminal payload."""
+    monkeypatch.setenv("VLLM_OMNI_T2A_WHOLE_UTTERANCE", "1")
+    manager = _manager()
+    request = _request("req")
+
+    assert tts2code2wav_async_chunk(manager, _delta(*range(40, 65)), request, False) is None
+    assert tts2code2wav_async_chunk(manager, _delta(*range(70, 95)), request, False) is None
+    assert tts2code2wav_async_chunk(manager, _delta(*range(100, 109)), request, False) is None
+
+    final = tts2code2wav_async_chunk(manager, _delta(99), request, True)
+    assert final is not None
+    assert _codes(final) == [4218, 4218, 4218, *range(40, 65), *range(70, 95), *range(100, 109), 99]
+    assert final.meta.chunk_seq == 0
+    assert final.meta.cache_epoch == 0
+    assert final.meta.codec_chunk_frames == 60
+    assert final.meta.codec_left_context_frames == 3
+    assert final.meta.code_flat_numel == 63
+    assert final.meta.last_chunk is True
+    assert final.meta.finished.item() is True
+    assert final.meta.tts_is_last_chunk is True
+
+    duplicate = tts2code2wav_async_chunk(manager, _delta(99), request, True)
+    assert duplicate is None
+
+
+def test_whole_utterance_mode_leaves_duplex_streaming(monkeypatch) -> None:
+    """Duplex sessions keep their streaming contract under whole-utterance mode."""
+    monkeypatch.setenv("VLLM_OMNI_T2A_WHOLE_UTTERANCE", "1")
+    manager = _manager()
+
+    payload = tts2code2wav_async_chunk(manager, _duplex_delta(*range(25), text="hi"), _request("req-duplex"), False)
+
+    assert payload is not None
+    assert _codes(payload) == [4218, 4218, 4218, *range(25)]
+    assert payload.meta.last_chunk is False
