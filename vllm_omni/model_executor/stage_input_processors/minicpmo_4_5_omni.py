@@ -3,7 +3,6 @@
 """MiniCPM-o 4.5 Thinker-to-Talker and Talker-to-Code2Wav bridges."""
 
 import logging
-import os
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -29,35 +28,6 @@ _MINICPMO45_ASYNC_STATE = "_minicpmo45_async_codec_state"
 _MINICPMO45_STREAM_RECORD = "_minicpmo45_async_stream_record"
 _MINICPMO45_SILENCE_CODE = 4218
 _MINICPMO45_MIN_STREAM_BODY_FRAMES = 5
-
-
-def _whole_utterance_tts_mode() -> int:
-    """Whole-utterance TTS experiment (``VLLM_OMNI_T2A_WHOLE_UTTERANCE``).
-
-    Mode 1: hold the Talker's codec stream until the request's terminal step,
-    then publish one seamless payload per request instead of fixed-size chunks
-    (single decode, zero seams — the pre-async serving shape). Mode 2: emit the
-    first steady window on the regular chunk schedule (so audio TTFP tracks the
-    chunked baseline) and hold everything after it for the terminal payload —
-    two Code2Wav solves per request instead of one, still far fewer than the
-    per-chunk stream. Both apply to non-duplex (turn-based TTS) requests only;
-    duplex sessions keep their streaming contract. Default 0: bit-identical.
-    """
-    value = os.environ.get("VLLM_OMNI_T2A_WHOLE_UTTERANCE", "")
-    return 2 if value == "2" else (1 if value == "1" else 0)
-
-
-def _whole_utterance_first_windows() -> int:
-    """Steady windows published on the chunk schedule in mode 2 (default 1).
-
-    A larger prefix narrows the gap between the first and the terminal solve:
-    the prefix solve takes about as long as generating the held remainder, so
-    sparse queues (low concurrency) keep stage2 busy instead of draining.
-    """
-    try:
-        return max(1, int(os.environ.get("VLLM_OMNI_T2A_FIRST_WINDOWS", "1")))
-    except ValueError:
-        return 1
 
 
 class _MiniCPMO45MetaStruct(MetaStruct):
@@ -442,34 +412,13 @@ def tts2code2wav_async_chunk(
     # the steady window itself at 25 frames it only added a seam.
     flush_pending = finished
     last_chunk = bool(flush_pending and (not native_duplex or turn_end))
-    whole_mode = _whole_utterance_tts_mode() if not native_duplex else 0
-    first_frames = _whole_utterance_first_windows() * chunk_frames if whole_mode == 2 else 0
-    if whole_mode and not flush_pending:
-        if whole_mode == 1:
-            # Hold the stream untouched; the terminal step below emits every
-            # accumulated frame as one seamless payload.
-            return None
-        if state["codec_end"] >= first_frames:
-            # Prefix already published; hold everything after it. The
-            # terminal step below emits the remainder as one seamless
-            # payload.
-            return None
-        if len(pending) < first_frames - state["codec_end"]:
-            # Prefix not complete: keep holding until it can be published as
-            # ONE payload (not N chunk-sized solves).
-            return None
     if not flush_pending and len(pending) < chunk_frames:
         return None
 
     hold_short_unit = (
         native_duplex and flush_pending and not last_chunk and 0 < len(pending) < _MINICPMO45_MIN_STREAM_BODY_FRAMES
     )
-    if whole_mode == 2 and not flush_pending and len(pending) >= first_frames - state["codec_end"]:
-        # Publish the whole prefix in one solve.
-        emit_count = first_frames - state["codec_end"]
-    else:
-        emit_count = chunk_frames
-    new_token_count = 0 if hold_short_unit else (len(pending) if flush_pending else emit_count)
+    new_token_count = 0 if hold_short_unit else (len(pending) if flush_pending else chunk_frames)
     new_codes = pending[:new_token_count]
     del pending[:new_token_count]
     codec_start = int(state["codec_end"])

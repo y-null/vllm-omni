@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import functools
 import math
-import os
 from collections import OrderedDict
 from collections.abc import Mapping
 from contextlib import nullcontext
@@ -58,24 +57,6 @@ _MAX_ENCODE_TOKEN_CAP = 1024
 # 100`` frames, keep the first ``prompt_len`` frames and the last 100.
 _CACHE_TRIM_SUFFIX = 100
 _TIMESTEP_MAX_PERIOD = 10000
-
-
-def _whole_utterance_capture_widths(wrapper) -> tuple[int, ...]:
-    """Whole-utterance pre-capture query grid (``VLLM_OMNI_T2A_WHOLE_UTTERANCE=1``).
-
-    Whole payloads arrive with arbitrary utterance lengths, so their decode
-    query widths span the utterance-length distribution instead of the fixed
-    chunk width. Without this grid every width captures lazily on first hit
-    (each capture stalls serving for ~2s) and the graph pool flushes under
-    budget pressure, re-capturing evicted shapes mid-run. The grid reuses the
-    configured query bucket as its step; ``VLLM_OMNI_T2A_WHOLE_MAX_MEL`` caps
-    the covered width (wider shapes keep capturing lazily, as before).
-    """
-    step = max(wrapper.query_widths) if wrapper.query_widths else 50
-    max_mel = int(os.environ.get("VLLM_OMNI_T2A_WHOLE_MAX_MEL", "") or 450)
-    return tuple(range(2 * step, max_mel + 1, step))
-
-
 # Short histories did not show a repeatable gain on Ascend 910B; only use
 # strided in-place attention once eliminating history copies pays for it.
 _NPU_IN_PLACE_ATTENTION_MIN_CACHE_FRAMES = 512
@@ -1814,22 +1795,6 @@ class BatchedToken2Wav(nn.Module):
         wrapper = self._whole_euler_graph_wrapper
         prompt_len = int(features.mels.shape[1])
         steady = prompt_len + _CACHE_TRIM_SUFFIX
-        query_widths = None
-        batches = None
-        if os.environ.get("VLLM_OMNI_T2A_WHOLE_UTTERANCE", "") == "1":
-            # Whole payloads never use the chunk-width graphs; spend the graph
-            # budget on the utterance-width grid instead (batch 1: whole rows
-            # decode one request at a time until cross-request merging lands).
-            query_widths = _whole_utterance_capture_widths(wrapper)
-            batches = (1,)
-            # Lift the arena attention-cache capacity to the deployment cap
-            # once: per-request offset growth otherwise reallocates the shared
-            # storage and flushes every captured graph mid-serving (~2.3s per
-            # capture, once per distinct ref length). 800 frames covers the
-            # largest whole query (900) plus the steady offset (400).
-            att_cap = int(os.environ.get("VLLM_OMNI_T2A_WHOLE_ATT_CAP", "1300") or 0)
-            if att_cap and att_cap > wrapper._att_capacity:
-                wrapper._att_capacity = att_cap
         with self._cfm_autocast(wrapper.device):
             return wrapper.precapture(
                 offsets=range(prompt_len, steady + 1),
@@ -1838,8 +1803,6 @@ class BatchedToken2Wav(nn.Module):
                 spk_dim=int(self.flow.spk_embed_affine_layer.out_features),
                 keep=(prompt_len, _CACHE_TRIM_SUFFIX),
                 tail_frames=(self._pre_lookahead_len() or 0) * int(getattr(self.flow, "token_mel_ratio", 2)),
-                query_widths=query_widths,
-                batches=batches,
             )
 
     def _create_initial_states(
