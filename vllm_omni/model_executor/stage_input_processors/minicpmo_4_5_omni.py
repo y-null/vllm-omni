@@ -443,12 +443,20 @@ def tts2code2wav_async_chunk(
     flush_pending = finished
     last_chunk = bool(flush_pending and (not native_duplex or turn_end))
     whole_mode = _whole_utterance_tts_mode() if not native_duplex else 0
+    first_frames = _whole_utterance_first_windows() * chunk_frames if whole_mode == 2 else 0
     if whole_mode and not flush_pending:
-        if whole_mode == 1 or state["codec_end"] >= _whole_utterance_first_windows() * chunk_frames:
-            # Mode 1 holds everything; mode 2 holds every frame after the
-            # first N steady windows (already published above on the chunk
-            # schedule). The terminal step below emits each mode's remainder
-            # as one seamless payload.
+        if whole_mode == 1:
+            # Hold the stream untouched; the terminal step below emits every
+            # accumulated frame as one seamless payload.
+            return None
+        if state["codec_end"] >= first_frames:
+            # Prefix already published; hold everything after it. The
+            # terminal step below emits the remainder as one seamless
+            # payload.
+            return None
+        if len(pending) < first_frames - state["codec_end"]:
+            # Prefix not complete: keep holding until it can be published as
+            # ONE payload (not N chunk-sized solves).
             return None
     if not flush_pending and len(pending) < chunk_frames:
         return None
@@ -456,7 +464,12 @@ def tts2code2wav_async_chunk(
     hold_short_unit = (
         native_duplex and flush_pending and not last_chunk and 0 < len(pending) < _MINICPMO45_MIN_STREAM_BODY_FRAMES
     )
-    new_token_count = 0 if hold_short_unit else (len(pending) if flush_pending else chunk_frames)
+    if whole_mode == 2 and not flush_pending and len(pending) >= first_frames - state["codec_end"]:
+        # Publish the whole prefix in one solve.
+        emit_count = first_frames - state["codec_end"]
+    else:
+        emit_count = chunk_frames
+    new_token_count = 0 if hold_short_unit else (len(pending) if flush_pending else emit_count)
     new_codes = pending[:new_token_count]
     del pending[:new_token_count]
     codec_start = int(state["codec_end"])
