@@ -74,3 +74,16 @@ __all__ = [
     # All other components are available through their respective modules
     # processors.*, schedulers.*, executors.*, etc.
 ]
+
+# vLLM's model-inspection subprocess (`python3 -m vllm.model_executor.models.registry`)
+# imports vllm_omni, and this environment aborts (SIGABRT, "corrupted size vs.
+# prev_size") while finalizing the interpreter. vLLM 0.32 treats that exit code
+# as a hard failure, which blocks engine startup. Terminate that child cleanly
+# right after its work is done; no state needs flushing there.
+import os as _os
+import sys as _sys
+
+if _sys.argv and _sys.argv[0].endswith("models/registry.py"):
+    import atexit as _atexit
+
+    _atexit.register(lambda: _os._exit(0))
