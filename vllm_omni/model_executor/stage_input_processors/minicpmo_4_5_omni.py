@@ -47,6 +47,19 @@ def _whole_utterance_tts_mode() -> int:
     return 2 if value == "2" else (1 if value == "1" else 0)
 
 
+def _whole_utterance_first_windows() -> int:
+    """Steady windows published on the chunk schedule in mode 2 (default 1).
+
+    A larger prefix narrows the gap between the first and the terminal solve:
+    the prefix solve takes about as long as generating the held remainder, so
+    sparse queues (low concurrency) keep stage2 busy instead of draining.
+    """
+    try:
+        return max(1, int(os.environ.get("VLLM_OMNI_T2A_FIRST_WINDOWS", "1")))
+    except ValueError:
+        return 1
+
+
 class _MiniCPMO45MetaStruct(MetaStruct):
     """Model-owned metadata for the split Talker-to-Code2Wav bridge."""
 
@@ -431,11 +444,11 @@ def tts2code2wav_async_chunk(
     last_chunk = bool(flush_pending and (not native_duplex or turn_end))
     whole_mode = _whole_utterance_tts_mode() if not native_duplex else 0
     if whole_mode and not flush_pending:
-        if whole_mode == 1 or state["codec_end"] > 0:
-            # Mode 1 holds everything; mode 2 holds every frame after the first
-            # steady window (already published above on the chunk schedule).
-            # The terminal step below emits each mode's remainder as one
-            # seamless payload.
+        if whole_mode == 1 or state["codec_end"] >= _whole_utterance_first_windows() * chunk_frames:
+            # Mode 1 holds everything; mode 2 holds every frame after the
+            # first N steady windows (already published above on the chunk
+            # schedule). The terminal step below emits each mode's remainder
+            # as one seamless payload.
             return None
     if not flush_pending and len(pending) < chunk_frames:
         return None
