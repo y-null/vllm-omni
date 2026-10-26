@@ -553,12 +553,20 @@ class BatchedToken2Wav(nn.Module):
                 # Resident request caches need the fused body and its tiled
                 # attention, which reads keys/values out of the pool in place.
                 slot_pool = bool(cfm_graph_cfg.get("slot_pool", False))
-                if slot_pool and not (
-                    flow_parameter.device.type == "cuda"
-                    and self._ragged_fused_body
+                # NPU runs the same ragged Whole-Euler fused body; without the
+                # CUDA-only tiled fast path its slot attention takes the generic
+                # in-place branch (pool-width keys with per-row layout masks).
+                _dev = flow_parameter.device.type
+                if slot_pool and _dev == "cuda" and not (
+                    self._ragged_fused_body
                     and tiled_attention_supported(flow_parameter.get_device())
                 ):
                     logger.warning("cfm_slot_pool requested but needs cfm_fused_body on NVIDIA SM80+; using the arena")
+                    slot_pool = False
+                if slot_pool and _dev == "npu" and not self._ragged_fused_body:
+                    logger.warning("cfm_slot_pool requested but NPU lacks the ragged fused body; using the arena")
+                    slot_pool = False
+                if slot_pool and _dev not in {"cuda", "npu"}:
                     slot_pool = False
                 if enable_whole_euler and self._trt_stepper is None:
                     capture_frames = cfm_graph_cfg.get("capture_frames")
