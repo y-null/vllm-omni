@@ -1153,7 +1153,6 @@ class GPUARModelRunner(
         committed_token_embeddings: torch.Tensor | None = None,
         consumed_input_span: bool = False,
     ) -> dict[str, object]:
-
         has_speculative_token_delta = committed_token_ids is not None
         payload: dict[str, object] = {}
         req_hidden_states = None
