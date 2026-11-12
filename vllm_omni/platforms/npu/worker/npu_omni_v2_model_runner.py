@@ -13,9 +13,12 @@ the same step.
 
 from __future__ import annotations
 
+import os
+import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
+import torch
 from vllm.logger import init_logger
 from vllm_ascend.worker.v2.model_runner import NPUModelRunner
 
@@ -251,7 +254,7 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
                 static_shape_decode.install_into_ascend_backend()
                 logger.info_once(
                     "[minicpmo] v2 static-shape decode backend installed (arch=%s)",
-                    architectures,
+                    ",".join(str(a) for a in architectures),
                 )
             except Exception:
                 logger.exception("[minicpmo] v2 static-shape install failed; stock backend kept")
@@ -377,6 +380,27 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
                     return out[0]
                 return out
 
+        # [KStepProf] optional per-step device timing: wrap each replay with
+        # NPU events so the loop's host time (logged in talker_multiframe.run)
+        # can be compared against the actual graph execution time. The final
+        # synchronize is profiling-only; without it the events would not be
+        # complete when elapsed_time is read.
+        profiling = os.environ.get("VLLM_OMNI_KSTEP_PROFILING", "0") == "1"
+        replay_events: list[tuple[torch.npu.Event, torch.npu.Event]] = []
+        if profiling:
+            inner_run_model = run_model
+
+            def run_model():  # type: ignore[misc]
+                ev0 = torch.npu.Event(enable_timing=True)
+                ev0.record()
+                hidden = inner_run_model()
+                ev1 = torch.npu.Event(enable_timing=True)
+                ev1.record()
+                replay_events.append((ev0, ev1))
+                return hidden
+
+            t_step = time.perf_counter()
+
         # No vocab sync is needed on this runner. The MRv2 step's input_batch
         # carries no vocab_size field (the sampling vocab lives on
         # model_config) and nothing on this path reads it: the two-wide
@@ -419,6 +443,21 @@ class NPUOmniARModelRunner(NPUOmniV2RunnerMixin, OmniARModelRunner, NPUModelRunn
         # drafts and postprocess now follow the frame-loop semantics until
         # the next decline re-disarms them.
         self._kstep_ran_last = True
+        if profiling:
+            step_ms = (time.perf_counter() - t_step) * 1000.0
+            if replay_events:
+                torch.npu.synchronize()
+                per_frame_ms = [f"{ev0.elapsed_time(ev1):.2f}" for ev0, ev1 in replay_events]
+                device_ms = sum(float(v) for v in per_frame_ms)
+                logger.info(
+                    "[KStepProf.dev] frames=%d step_host_ms=%.2f replay_device_ms=%.2f per_frame_ms=%s",
+                    frames,
+                    step_ms,
+                    device_ms,
+                    ",".join(per_frame_ms),
+                )
+            else:
+                logger.info("[KStepProf.dev] frames=%d step_host_ms=%.2f replay_device_ms=n/a", frames, step_ms)
         return out
 
     def _propose_draft_tokens(self, input_batch, draft, num_sampled, num_rejected, mm_inputs):

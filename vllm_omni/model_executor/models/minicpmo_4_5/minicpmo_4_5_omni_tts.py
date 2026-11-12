@@ -12,7 +12,9 @@ Pipeline:
   5. Next decode embeds that id with emb_code and emits it to Code2Wav
 """
 
+import os
 import random
+import time
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import replace
 from functools import cached_property
@@ -96,6 +98,12 @@ _CODEC_TOP_P = 0.85
 _CODEC_REPETITION_PENALTY = 1.05
 _CODEC_MIN_TOKENS = 50
 _CODEC_MAX_TOKENS = 2048
+# [KStepProf] optional per-frame host-sampling breakdown timing;
+# [CodecDevTopK] optional device-side censoring/penalty/temperature/top-k
+# prelude for the NPU host-sampling path: only the top-k candidate values/ids
+# cross to the host instead of the raw ~26KB logits row. Both default off.
+_KSTEP_PROFILING = os.environ.get("VLLM_OMNI_KSTEP_PROFILING", "0") == "1"
+_CODEC_DEV_TOPK = os.environ.get("VLLM_OMNI_CODEC_DEV_TOPK", "0") == "1"
 # The Talker's two-wide stop head emits continue/stop control rows under
 # multi-frame decode: 0=continue, 1=stop. Those ids belong to the
 # scheduler's control channel, not the 6562-wide codec stream, where both
@@ -2743,6 +2751,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 f"remaining-token budgets for {len(infos)} requests"
             )
         emit_duplex_metadata = any(isinstance(info, dict) and info.get("native_duplex") is True for info in infos)
+        if _KSTEP_PROFILING and emit_duplex_metadata:
+            self._kstep_duplex_frames = getattr(self, "_kstep_duplex_frames", 0) + 1
 
         # Hoisted out of the per-request loop: this is the same dict for every
         # row of the frame, and the loop runs rows x frames times per step.
@@ -3555,54 +3565,123 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         # The frame loop advances state["step"] (and passes it here) in
         # lockstep with the device state's own counter, so trust the caller.
         hstate["step"] = int(step)
-        # Device: project + one D2H of the raw logits row; the numpy chain (~0.9 ms/frame
-        # cheaper than CPU torch ops) then overlaps the pre-submitted next head.
-        lg = (
-            (lg_dev if lg_dev is not None else self.head_code[0](hidden_state).float().reshape(-1).detach())
-            .cpu()
-            .numpy()
-        )
-        # Engine step 3-4: stop censoring before any penalty.
-        if eos_window_masked or hstate["step"] < int(min_tokens):
-            lg[list(stop_ids)] = -np.inf
-        # Engine step 6a: repetition penalty over the history window.
-        hist = hstate["history"]
-        if repetition_penalty != 1.0 and hist:
-            counts: dict[int, int] = {}
-            for tid in hist:
-                counts[tid] = counts.get(tid, 0) + 1
-            for tid, count in counts.items():
-                alpha = repetition_penalty**count
-                value = float(lg[tid])
-                lg[tid] = value / alpha if value >= 0 else value * alpha
-        # Engine steps 6b/6c: whole-stream frequency and presence penalties.
-        bins = hstate["bins"]
-        if frequency_penalty and bins:
-            for tid, count in bins.items():
-                lg[tid] = float(lg[tid]) - frequency_penalty * count
-        if presence_penalty and bins:
-            for tid in bins:
-                lg[tid] = float(lg[tid]) - presence_penalty
-        # Engine steps 7b-7d and the draw (or the greedy argmax).
-        if temperature == 0.0:
-            sampled_id = int(np.argmax(lg))
+        _t0 = time.perf_counter() if _KSTEP_PROFILING else 0.0
+        dev_topk = _CODEC_DEV_TOPK and lg_dev is not None and 0 < int(top_k) < int(lg_dev.numel())
+        sub = None
+        cand = None
+        sampled_id = None
+        if dev_topk:
+            # [CodecDevTopK] Device prelude: stop censoring, repetition /
+            # frequency / presence penalties, temperature and top-k run on
+            # the NPU; only the k candidate values/ids cross to the host
+            # instead of the raw ~26KB logits row. The host then runs the
+            # same min_p/top_p/draw math on the same candidate values with
+            # the same per-request random.Random stream: min_p's accept rule
+            # reduces to exp(lg - lg.max()) < min_p (the partition function
+            # cancels) and the candidate max is the global max; top_p and
+            # the draw are defined on this candidate subset either way.
+            # Penalty arithmetic is done in float64 and cast back, matching
+            # the numpy chain's float64-scalar-into-float32-store rounding.
+            # Residual divergence is limited to exact ties at the k-th value
+            # (numpy kept every tie member, torch.topk keeps exactly k) and
+            # argmax tie order — both measure-zero for continuous logits.
+            lg_d = lg_dev.reshape(-1)
+            if eos_window_masked or hstate["step"] < int(min_tokens):
+                lg_d[self._codec_dev_stop_index(tuple(stop_ids), lg_d.device)] = float("-inf")
+            hist = hstate["history"]
+            if repetition_penalty != 1.0 and hist:
+                counts: dict[int, int] = {}
+                for tid in hist:
+                    counts[tid] = counts.get(tid, 0) + 1
+                pidx = torch.tensor(list(counts.keys()), dtype=torch.long, device=lg_d.device)
+                palpha = torch.tensor(
+                    [repetition_penalty**c for c in counts.values()], dtype=torch.float64, device=lg_d.device
+                )
+                pvals = lg_d[pidx].double()
+                lg_d[pidx] = torch.where(pvals >= 0, pvals / palpha, pvals * palpha).float()
+            bins = hstate["bins"]
+            if frequency_penalty and bins:
+                fidx = torch.tensor(list(bins.keys()), dtype=torch.long, device=lg_d.device)
+                fcnt = torch.tensor([float(c) for c in bins.values()], dtype=torch.float64, device=lg_d.device)
+                lg_d[fidx] = (lg_d[fidx].double() - frequency_penalty * fcnt).float()
+            if presence_penalty and bins:
+                pridx = torch.tensor(list(bins.keys()), dtype=torch.long, device=lg_d.device)
+                lg_d[pridx] = (lg_d[pridx].double() - presence_penalty).float()
+            if temperature == 0.0:
+                sampled_id = int(torch.argmax(lg_d).item())
+            else:
+                if temperature != 1.0:
+                    lg_d = lg_d / temperature
+                cand_vals, cand_ids = torch.topk(lg_d, int(top_k))
+                lg = cand_vals.cpu().numpy()
+                cand = cand_ids.cpu().numpy()
+                if min_p > 0.0:
+                    dprobs = np.exp(lg - lg.max())
+                    dkeep = dprobs >= dprobs.max() * min_p
+                    lg = lg[dkeep]
+                    cand = cand[dkeep]
+                # The full-row chain's flatnonzero yields survivors in
+                # ascending vocab order; normalize the top-k order to match
+                # so argsort/cumsum ties and the draw see identical inputs.
+                vord = np.argsort(cand, kind="stable")
+                lg = np.ascontiguousarray(lg[vord])
+                cand = np.ascontiguousarray(cand[vord])
+                sub = lg
+            _t1 = time.perf_counter() if _KSTEP_PROFILING else 0.0
         else:
-            lg = lg / temperature
-            if min_p > 0.0:
-                probs = np.exp(lg - lg.max())
-                probs /= probs.sum()
-                threshold = probs.max() * min_p
-                lg[probs < threshold] = -np.inf
-            if 0 < top_k < lg.size:
-                # Same semantics as the engine prelude: keep every logit
-                # >= the k-th largest value (ties keep all members).
-                threshold = np.partition(lg, -int(top_k))[-int(top_k)]
-                lg[lg < threshold] = -np.inf
-            # top_p and the draw run on the surviving candidate subset
-            # only: -inf entries carry probability zero, so the cumsum is
-            # just shifted across them and the draw is unchanged.
-            cand = np.flatnonzero(lg > -np.inf)
-            sub = lg[cand]
+            # Device: project + one D2H of the raw logits row; the numpy chain (~0.9 ms/frame
+            # cheaper than CPU torch ops) then overlaps the pre-submitted next head.
+            lg = (
+                (lg_dev if lg_dev is not None else self.head_code[0](hidden_state).float().reshape(-1).detach())
+                .cpu()
+                .numpy()
+            )
+            _t1 = time.perf_counter() if _KSTEP_PROFILING else 0.0
+            # Engine step 3-4: stop censoring before any penalty.
+            if eos_window_masked or hstate["step"] < int(min_tokens):
+                lg[list(stop_ids)] = -np.inf
+            # Engine step 6a: repetition penalty over the history window.
+            hist = hstate["history"]
+            if repetition_penalty != 1.0 and hist:
+                counts: dict[int, int] = {}
+                for tid in hist:
+                    counts[tid] = counts.get(tid, 0) + 1
+                for tid, count in counts.items():
+                    alpha = repetition_penalty**count
+                    value = float(lg[tid])
+                    lg[tid] = value / alpha if value >= 0 else value * alpha
+            # Engine steps 6b/6c: whole-stream frequency and presence penalties.
+            bins = hstate["bins"]
+            if frequency_penalty and bins:
+                for tid, count in bins.items():
+                    lg[tid] = float(lg[tid]) - frequency_penalty * count
+            if presence_penalty and bins:
+                for tid in bins:
+                    lg[tid] = float(lg[tid]) - presence_penalty
+            # Engine steps 7b-7d and the draw (or the greedy argmax).
+            if temperature == 0.0:
+                sampled_id = int(np.argmax(lg))
+            else:
+                lg = lg / temperature
+                if min_p > 0.0:
+                    probs = np.exp(lg - lg.max())
+                    probs /= probs.sum()
+                    threshold = probs.max() * min_p
+                    lg[probs < threshold] = -np.inf
+                if 0 < top_k < lg.size:
+                    # Same semantics as the engine prelude: keep every logit
+                    # >= the k-th largest value (ties keep all members).
+                    threshold = np.partition(lg, -int(top_k))[-int(top_k)]
+                    lg[lg < threshold] = -np.inf
+                # top_p and the draw run on the surviving candidate subset
+                # only: -inf entries carry probability zero, so the cumsum is
+                # just shifted across them and the draw is unchanged.
+                cand = np.flatnonzero(lg > -np.inf)
+                sub = lg[cand]
+        if sampled_id is None:
+            # Shared top_p + draw over the surviving candidate subset; both
+            # paths hand over (sub, cand) with identical values in the same
+            # ascending-vocab order, so the draw is unchanged.
             if 0.0 < float(top_p) < 1.0:
                 order = np.argsort(sub)
                 p_sorted = np.exp(sub[order] - sub[order][-1])
@@ -3622,6 +3701,12 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             if j >= probs.size:
                 j = probs.size - 1
             sampled_id = int(cand[j])
+        if _KSTEP_PROFILING:
+            brk = getattr(self, "_kstep_sample_brk", None)
+            if brk is None:
+                brk = []
+                self._kstep_sample_brk = brk
+            brk.append(((_t1 - _t0) * 1000.0, (time.perf_counter() - _t1) * 1000.0))
         # eos/stop/limit transition mirroring _classify_stop +
         # _advance_classified (single source of the emit decision).
         is_eos = (not ignore_eos) and sampled_id == eos_token_id
@@ -3640,6 +3725,26 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             if frequency_penalty or presence_penalty:
                 bins[sampled_id] = bins.get(sampled_id, 0) + 1
         return sampled_id, finished, emit
+
+    def _codec_dev_stop_index(self, stop_ids: tuple[int, ...], device: torch.device) -> torch.Tensor:
+        """Cached device index tensor for the stop-id censoring scatter."""
+        cache = getattr(self, "_codec_dev_stop_index_cache", None)
+        if cache is None:
+            cache = {}
+            self._codec_dev_stop_index_cache = cache
+        key = (str(device), stop_ids)
+        idx = cache.get(key)
+        if idx is None:
+            idx = torch.tensor(list(stop_ids), dtype=torch.long, device=device)
+            cache[key] = idx
+        return idx
+
+    def _kstep_pop_sample_breakdown(self) -> list[tuple[float, float]]:
+        """Drain per-frame (d2h_ms, chain_ms) pairs collected under
+        VLLM_OMNI_KSTEP_PROFILING by the host codec sampler."""
+        brk = getattr(self, "_kstep_sample_brk", None)
+        self._kstep_sample_brk = []
+        return brk or []
 
     def _step_constants(self, hidden: torch.Tensor):
         """Constant per-step tensors, cached per (device, dtype).

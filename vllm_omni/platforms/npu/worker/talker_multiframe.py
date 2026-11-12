@@ -64,6 +64,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -76,6 +77,11 @@ from vllm_omni.model_executor.models.interfaces import supports_multi_frame_deco
 logger = init_logger(__name__)
 
 _LOGGED_ENGAGE = False
+
+
+def _kstep_profiling_enabled() -> bool:
+    """Per-frame host-side timing for the K-step frame loop (opt-in)."""
+    return os.environ.get("VLLM_OMNI_KSTEP_PROFILING", "0") == "1"
 
 
 def neutralize_kstep_min_tokens(logitsprocs: Any) -> None:
@@ -499,7 +505,12 @@ def run(
     frame_outputs = []
     frame_stop_logits = []
     frame_hidden = []
+    profiling = _kstep_profiling_enabled()
+    embed_ms = replay_ms = output_ms = 0.0
+    per_frame: list[str] = []
+    t_loop = time.perf_counter()
     for frame in range(frames):
+        t_seg = time.perf_counter() if profiling else 0.0
         if narrow is not None:
             # Frame 0's embeddings are already in the buffer, but at the rows a
             # K-query step laid them out on: request r's is at row r*K, and the
@@ -514,10 +525,18 @@ def run(
                 _write_frame_embeddings(model, target_embeds, input_ids, spans, infos, frame, narrow=narrow)
         elif frame > 0:
             _write_frame_embeddings(model, inputs_embeds, input_ids, spans, infos, frame)
+        if profiling:
+            _embed = time.perf_counter() - t_seg
+            embed_ms += _embed
+            t_seg = time.perf_counter()
         if narrow is not None and hasattr(narrow, "run_model"):
             hidden = narrow.run_model(run_model, capture=False)
         else:
             hidden = run_model()
+        if profiling:
+            _replay = time.perf_counter() - t_seg
+            replay_ms += _replay
+            t_seg = time.perf_counter()
         after_forward()
         frame_kwargs = dict(model_kwargs_extra)
         frame_kwargs["request_token_spans"] = (
@@ -536,11 +555,45 @@ def run(
             raise RuntimeError("MiniCPM-o multi-frame decode expects stop rows from every frame")
         frame_outputs.append(output)
         frame_stop_logits.append(stop_logits)
+        if profiling:
+            _output = time.perf_counter() - t_seg
+            output_ms += _output
+            per_frame.append(f"{_embed * 1000:.1f}/{_replay * 1000:.1f}/{_output * 1000:.1f}")
 
     if not _LOGGED_ENGAGE:
         _LOGGED_ENGAGE = True
         logger.info("[minicpmo] multi-frame Talker decode engaged: %d codec frames per step", frames)
+    t_merge = time.perf_counter() if profiling else 0.0
     merged = model.merge_frame_outputs(frame_outputs, frame_stop_logits)
+    if profiling:
+        merge_ms = time.perf_counter() - t_merge
+        loop_ms = time.perf_counter() - t_loop
+        d2h_ms = chain_ms = 0.0
+        sample_n = 0
+        pop_breakdown = getattr(model, "_kstep_pop_sample_breakdown", None)
+        if callable(pop_breakdown):
+            brk = pop_breakdown()
+            if brk:
+                sample_n = len(brk)
+                d2h_ms = sum(b[0] for b in brk) / sample_n
+                chain_ms = sum(b[1] for b in brk) / sample_n
+        duplex_frames = getattr(model, "_kstep_duplex_frames", 0)
+        model._kstep_duplex_frames = 0
+        logger.info(
+            "[KStepProf.host] frames=%d reqs=%d loop_ms=%.2f embed_ms=%.2f replay_submit_ms=%.2f output_ms=%.2f merge_ms=%.2f sample_d2h_ms=%.3f sample_chain_ms=%.3f sample_n=%d duplex_frames=%d per_frame_ms[embed/replay/output]=%s",
+            frames,
+            len(spans),
+            loop_ms * 1000,
+            embed_ms * 1000,
+            replay_ms * 1000,
+            output_ms * 1000,
+            merge_ms * 1000,
+            d2h_ms,
+            chain_ms,
+            sample_n,
+            duplex_frames,
+            ",".join(per_frame),
+        )
     if narrow is not None and frame_hidden:
         # (frames, rows, hidden) -> (rows * frames, hidden), request-major --
         # the layout `logits_indices` reads. OmniOutput is a NamedTuple.
