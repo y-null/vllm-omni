@@ -24,7 +24,6 @@ from typing import Any
 
 import torch
 from vllm.logger import init_logger
-
 from vllm_omni.utils.cuda_stream import create_cuda_stream
 
 from .cuda_graph_wrapper import _graph_api, _graph_execution_context
@@ -88,10 +87,12 @@ class FlowEncoderGraphs:
         capture_after_precapture: bool = False,
         eager_min_batch: int | None = None,
         chunk_forward: Callable | None = None,
+        terminal: bool = False,
     ) -> None:
         self.encode_fn = encode_fn
         self.rows = tuple(sorted({int(r) for r in rows if int(r) > 0}))
         self.lookahead, self.upsample = int(lookahead), int(upsample)
+        self.terminal = terminal
         self.token_widths = tuple(sorted({int(w) for w in token_widths if int(w) > self.lookahead}))
         self._held_tensors = held_tensors
         self._held: tuple[torch.Tensor, ...] = ()
@@ -206,12 +207,15 @@ class FlowEncoderGraphs:
         def shapes(key: tuple[int, int, int]) -> dict[str, tuple[int, ...]]:
             rows, width, frames = key
             out = self.output_frames(width)
+            # The CosyVoice pre-lookahead cache keeps at most two frames
+            # from this chunk; the upsampling cache retains its full width.
+            cnn_frames = cnn_shape[1] - max(0, 2 - width) if self.terminal else cnn_shape[1]
             return {
                 "tokens": (rows, width),
                 "cnn": (rows, *cnn_shape),
                 "att": (depth, rows, heads, frames, att_width),
                 "hidden": (rows, out, hidden_dim),
-                "new_cnn": (rows, *cnn_shape),
+                "new_cnn": (rows, cnn_shape[0], cnn_frames),
                 "new_att": (depth, rows, heads, frames + out, att_width),
             }
 

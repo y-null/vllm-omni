@@ -32,7 +32,6 @@ from typing import TYPE_CHECKING, TypeVar, cast
 
 import pybase64 as base64
 from vllm.logger import init_logger
-
 from vllm_omni.engine.duplex.commands import (
     AckPlayback,
     AppendAudio,
@@ -100,7 +99,6 @@ from vllm_omni.engine.duplex.realtime_events import (
     resolve_truncate_item,
     retrieve_item_events,
 )
-from vllm_omni.engine.duplex.session import helpers, overlap_policy, playback_ledger
 from vllm_omni.engine.duplex.session.append_task import AppendAttempt
 from vllm_omni.engine.duplex.session.commit_policy import CommitAction, CommitSnapshot, decide_commit_action
 from vllm_omni.engine.duplex.session.context import (
@@ -129,10 +127,11 @@ from vllm_omni.engine.duplex.turn_detection import (
 from vllm_omni.metrics.stats import StageRequestStats
 from vllm_omni.protocol.duplex import CONVERTIBLE_INPUT_FORMATS, convert_input_audio_with_rate
 
+from vllm_omni.engine.duplex.session import helpers, overlap_policy, playback_ledger
+
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
     from vllm.outputs import RequestOutput
-
     from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
 
 logger = init_logger(__name__)
@@ -1727,7 +1726,7 @@ class DuplexSessionRunner:
             out=self.out,
             model=self.model,
             fail_session=self._fail_session_from_append,
-            payload=payload,
+            payload={**payload, "_native_explicit_reply": True} if precreate_response and final else payload,
             epoch=append_epoch,
             request_id=request_id,
             final=final,
