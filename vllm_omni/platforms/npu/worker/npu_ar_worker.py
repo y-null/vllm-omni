@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from vllm.logger import init_logger
 from vllm.v1.worker.workspace import init_workspace_manager
@@ -26,6 +26,10 @@ class NPUARWorker(OmniWorkerMixin, OmniNPUWorkerBase):
 
     def init_device(self):
         self.device = self._init_device()
+        if self.use_v2_model_runner:
+            from vllm_omni.platforms.npu.minicpmo_shared_kv import install_minicpmo_shared_kv
+
+            install_minicpmo_shared_kv(self.vllm_config)
         num_ubatches = 1
         init_workspace_manager(self.device, num_ubatches)
 
