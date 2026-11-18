@@ -38,7 +38,12 @@ from vllm.v1.worker.gpu.metrics.logits import get_num_nans
 from vllm.v1.worker.gpu.sample.logits_processor import LogitsContext, LogitsProcessor
 from vllm.v1.worker.gpu.sample.output import SamplerOutput as Mrv2SamplerOutput
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
+
 from vllm_omni.engine.duplex.intermediate import get_tts_handoff
+from vllm_omni.model_executor.models.minicpmo_4_5 import (
+    MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK,
+    MINICPMO45_DUPLEX_TURN_END_CODEC_TOKENS,
+)
 from vllm_omni.model_executor.models.minicpmo_4_5.config_flags import (
     parse_bool_flag as _bool_flag,
 )
@@ -64,16 +69,11 @@ from vllm_omni.model_executor.models.minicpmo_4_5.talker_kstep_contract import (
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.talker_mrv2_sampling import draw_v1_codec_ids
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.platforms import current_omni_platform
 from vllm_omni.utils.device_copy import index_to_device, to_device_nonblocking
 from vllm_omni.utils.seeded_exponential import fill_exponential_rows, fill_exponential_steps
 from vllm_omni.worker_v2.omni_sampler import OmniSampler
 from vllm_omni.worker_v2.warmup import is_warmup_request
-
-from vllm_omni.model_executor.models.minicpmo_4_5 import (
-    MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK,
-    MINICPMO45_DUPLEX_TURN_END_CODEC_TOKENS,
-)
-from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 

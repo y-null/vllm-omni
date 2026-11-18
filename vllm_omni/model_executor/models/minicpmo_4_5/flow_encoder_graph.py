@@ -24,6 +24,7 @@ from typing import Any
 
 import torch
 from vllm.logger import init_logger
+
 from vllm_omni.utils.cuda_stream import create_cuda_stream
 
 from .cuda_graph_wrapper import _graph_api, _graph_execution_context
